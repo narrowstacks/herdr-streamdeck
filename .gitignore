@@ -1,0 +1,3 @@
+node_modules/
+com.aaronfa.herdr-agents.sdPlugin/bin/
+*.log

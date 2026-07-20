@@ -1,0 +1,25 @@
+{
+	"$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+	"UUID": "com.aaronfa.herdr-agents",
+	"Name": "Herdr Agents",
+	"Version": "0.1.0.0",
+	"Author": "aaron f.a",
+	"Description": "Surfaces herdr agent state on your Stream Deck and alerts when an agent needs attention.",
+	"Icon": "imgs/plugin",
+	"CodePath": "bin/plugin.js",
+	"SDKVersion": 2,
+	"Nodejs": {
+		"Version": "20",
+		"Debug": "enabled"
+	},
+	"Software": {
+		"MinimumVersion": "6.5"
+	},
+	"OS": [
+		{
+			"Platform": "mac",
+			"MinimumVersion": "10.15"
+		}
+	],
+	"Actions": []
+}
