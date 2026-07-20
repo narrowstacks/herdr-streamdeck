@@ -54,4 +54,20 @@ describe("resolveKeymap", () => {
 	it("does not throw when agentLabel is not a string", () => {
 		expect(resolveKeymap(42 as unknown as string, TABLE)).toEqual(TABLE.default);
 	});
+
+	it("does not throw and degrades to DEFAULT_KEYMAP when table is null", () => {
+		expect(resolveKeymap("claude", null as unknown as KeymapTable)).toEqual(
+			DEFAULT_KEYMAP.default,
+		);
+	});
+
+	it("does not throw and degrades to DEFAULT_KEYMAP when table is a non-object primitive (number)", () => {
+		expect(resolveKeymap("claude", 42 as unknown as KeymapTable)).toEqual(DEFAULT_KEYMAP.default);
+	});
+
+	it("does not throw and degrades to DEFAULT_KEYMAP when table is a non-object primitive (string)", () => {
+		expect(resolveKeymap("claude", "not-a-table" as unknown as KeymapTable)).toEqual(
+			DEFAULT_KEYMAP.default,
+		);
+	});
 });

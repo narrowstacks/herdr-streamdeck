@@ -112,6 +112,18 @@ describe("AgentRegistry reconcile concurrency", () => {
 		expect(sawRevert).toBe(false);
 	});
 
+	// NON-DISCRIMINATING: this test passes against both the pre-fix and
+	// post-fix code and must not be read as coverage of the wire-level
+	// double-subscribe it was originally written to catch. subscribeNewPanes()
+	// computes its `fresh` list and marks `subscribedPanes` synchronously with
+	// no `await` in between, so two reconciles' calls can never interleave
+	// mid-computation under Node's single-threaded execution model - the
+	// scenario this test sets up is simply not reachable through the public
+	// API. The sibling test below ("a superseded reconcile's own snapshot
+	// must never reach subscribeNewPanes", w1-2 vs w1-3) exercises the actual
+	// root cause and does discriminate; it is the one that provides real
+	// coverage here. This test is kept only as an inert regression lock -
+	// do not treat its passing as evidence of anything.
 	it("Important repro: two rapid lifecycle events produce only one subscribe for a given pane_id", async () => {
 		const socketPath = await server.start();
 		const seen: HerdrRequest[] = [];
