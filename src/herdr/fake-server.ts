@@ -4,7 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import type { HerdrRequest } from "./types.js";
 
-type RequestHandler = (req: HerdrRequest) => unknown | undefined;
+type RequestHandler = (req: HerdrRequest, socket: net.Socket) => unknown | undefined;
 
 let counter = 0;
 
@@ -32,7 +32,7 @@ export class FakeHerdrServer {
 					buffer = buffer.slice(index + 1);
 					if (!line.trim()) continue;
 					const req = JSON.parse(line) as HerdrRequest;
-					const response = this.handler(req);
+					const response = this.handler(req, socket);
 					if (response !== undefined) {
 						socket.write(JSON.stringify(response) + "\n");
 					}

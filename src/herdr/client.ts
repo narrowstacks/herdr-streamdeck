@@ -57,6 +57,18 @@ export class HerdrClient extends EventEmitter {
 	// promise that merely adopts its state. An `async` method would allocate
 	// a fresh wrapper promise per call, and an unhandled rejection on *that*
 	// wrapper is exactly the failure mode this fix removes.
+	//
+	// Finding 2 (Minor): resolving does NOT guarantee the client ended up
+	// live. If close() races an in-flight attempt, the shared promise
+	// deliberately RESOLVES rather than rejects (see the design note on
+	// settleConnectingOnClose()/close() - rejecting it reintroduces an
+	// unhandled-rejection crash for callers who never awaited/caught this
+	// promise). In that one window, `await client.connect()` can return
+	// successfully while `client.connected` is already false. Callers that
+	// need to know the outcome should check `.connected` right after
+	// awaiting, or simply issue a `request()` and handle its immediate
+	// "herdr client is not connected" rejection - it fails fast rather than
+	// hanging.
 	connect(): Promise<void> {
 		this.closed = false;
 		return this.openOnce();
@@ -76,8 +88,14 @@ export class HerdrClient extends EventEmitter {
 			// synchronously (before the new connection even starts) so in-flight
 			// data from a stale connection can never reach onData twice, and
 			// reset the buffer so a fragment from the dead connection can't
-			// splice into the new stream.
-			this.detachSocket();
+			// splice into the new stream. This path (a fresh openOnce() call
+			// while `this.socket` is still live) is reachable even after the
+			// reconnectTimer-cancellation fix above: a manual connect() called
+			// again while already connected - with requests in flight on the
+			// current socket - hits this same detachSocket() with no timer
+			// involved at all. See detachSocket()'s own comment for why it
+			// fails pending requests rather than leaving them to hang.
+			this.detachSocket(new Error("herdr client reconnecting"));
 
 			const socket = net.createConnection(this.options.socketPath);
 			socket.setEncoding("utf8");
@@ -110,6 +128,21 @@ export class HerdrClient extends EventEmitter {
 				this.socket = socket;
 				this.isConnected = true;
 				this.attempt = 0;
+				// Finding 1 (Important) guard: a manual connect() can race an
+				// already-armed reconnectTimer (scheduleReconnect() runs
+				// independently of connectingPromise, since nothing is in flight
+				// yet when the timer is armed by handleDrop()). If this attempt -
+				// manual or the reconnect timer's own - wins the race and lands a
+				// live socket, any older reconnectTimer must be cancelled here.
+				// Otherwise it fires later against this good connection, and its
+				// openOnce() call unconditionally detachSocket()s - tearing down a
+				// live socket and orphaning whatever is in `pending` - to open a
+				// second, redundant connection, firing a spurious "connected"
+				// with no matching "disconnected".
+				if (this.reconnectTimer) {
+					clearTimeout(this.reconnectTimer);
+					this.reconnectTimer = undefined;
+				}
 				this.buffer = "";
 				socket.on("data", (chunk: string) => this.onData(chunk));
 				socket.on("error", () => {});
@@ -137,7 +170,19 @@ export class HerdrClient extends EventEmitter {
 		return promise;
 	}
 
-	private detachSocket(): void {
+	// Finding 1 defensive guard: even with reconnectTimer now cancelled on a
+	// successful connect (the headline fix above), detachSocket() can still
+	// be reached with a live, in-use socket - e.g. connect() called again
+	// while already connected, with requests in flight on the current
+	// socket (see the double-connect tests, which exercise exactly this
+	// call pattern, just without pending requests). Whoever calls this with
+	// a still-live socket is, by definition, discarding it, so any request
+	// written to it can never be answered on it again. Failing `pending`
+	// here - inside detachSocket() itself, not left to each call site -
+	// means no path through this method can ever again strand a request
+	// forever, regardless of what future callers of openOnce()/detachSocket()
+	// look like.
+	private detachSocket(reason: Error): void {
 		const socket = this.socket;
 		this.socket = undefined;
 		this.isConnected = false;
@@ -146,6 +191,7 @@ export class HerdrClient extends EventEmitter {
 			socket.removeAllListeners();
 			socket.destroy();
 		}
+		this.failPending(reason);
 	}
 
 	// close()-during-connect design decision: this RESOLVES the shared
@@ -239,8 +285,13 @@ export class HerdrClient extends EventEmitter {
 		// reconnect timer) synchronously, not just the already-established
 		// socket, so it can never resurrect the client after close().
 		this.settleConnectingOnClose();
-		this.detachSocket();
-		this.failPending(new Error("herdr client closed"));
+		// detachSocket() fails any still-pending requests on the current
+		// socket itself (see its own comment) - no separate failPending()
+		// call is needed here. Requests can only ever be pending against a
+		// socket that was live at request() time, so if handleDrop() hasn't
+		// already cleared both `this.socket` and `pending` together, this is
+		// the only remaining place they can be outstanding.
+		this.detachSocket(new Error("herdr client closed"));
 	}
 
 	private onData(chunk: string): void {
