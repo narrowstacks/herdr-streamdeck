@@ -52,6 +52,53 @@ function toStatus(raw: string | undefined): AgentStatus {
 	return STATUSES.includes(raw as AgentStatus) ? (raw as AgentStatus) : "unknown";
 }
 
+// herdr's global pane-lifecycle subscriptions - no `pane_id`, confirmed
+// against a live herdr server not to require one (unlike
+// pane.agent_status_changed below, which does). Subscribed once, globally,
+// in start() and again on every reconnect, since herdr has no unsubscribe
+// and subscriptions do not survive a new connection.
+const LIFECYCLE_SUBSCRIPTIONS = [
+	{ type: "pane.created" },
+	{ type: "pane.closed" },
+	{ type: "pane.agent_detected" },
+];
+
+const LIFECYCLE_EVENT_TYPES = new Set(["pane.created", "pane.closed", "pane.agent_detected"]);
+
+// The second untrusted input path (the first being agent.list's response,
+// guarded by isAgentListResult above). A pushed event is whatever herdr
+// wrote to the socket, parsed as JSON with zero shape guarantee - it can be
+// null, a primitive, an array, an object missing `type`, or a
+// pane.agent_status_changed with a missing/non-string pane_id. This is the
+// SOLE place that reads into a pushed event's fields, mirroring
+// isAgentListResult(): every field access (`type`, `pane_id`, `agent_status`)
+// happens here, once, behind typeof/null checks, and nothing downstream
+// (onEvent) reads the raw payload directly.
+type ParsedHerdrEvent =
+	| { kind: "lifecycle" }
+	| { kind: "status"; paneId: string; status: AgentStatus };
+
+function parseHerdrEvent(value: unknown): ParsedHerdrEvent | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const type = (value as { type?: unknown }).type;
+	if (typeof type !== "string") return undefined;
+
+	if (LIFECYCLE_EVENT_TYPES.has(type)) return { kind: "lifecycle" };
+
+	if (type === "pane.agent_status_changed") {
+		const paneId = (value as { pane_id?: unknown }).pane_id;
+		if (typeof paneId !== "string" || paneId.length === 0) return undefined;
+		const agentStatus = (value as { agent_status?: unknown }).agent_status;
+		return {
+			kind: "status",
+			paneId,
+			status: toStatus(typeof agentStatus === "string" ? agentStatus : undefined),
+		};
+	}
+
+	return undefined;
+}
+
 // Defensive by construction: a malformed entry (null, a non-object, or one
 // missing a usable pane_id) returns `undefined` instead of throwing. Finding
 // 2's repro was `agents: [null]` blowing up on `.pane_id` outside any
@@ -95,6 +142,13 @@ export class AgentRegistry extends EventEmitter {
 	// or listen for "agent:malformed" (emitted with the count dropped on
 	// that reconcile) to notice herdr is sending bad data.
 	private droppedMalformedCount = 0;
+	// Tracks pane ids we've already sent a `pane.agent_status_changed`
+	// subscription for. herdr exposes no unsubscribe, so subscriptions for
+	// panes that later close are simply left to lapse - this set exists only
+	// to prevent re-sending a duplicate subscribe for a pane already covered.
+	// Cleared on disconnect (see onDisconnected): subscriptions do not
+	// survive a new connection, so the bookkeeping for the old one is void.
+	private subscribedPanes = new Set<string>();
 
 	constructor(
 		private readonly client: HerdrClient,
@@ -145,6 +199,19 @@ export class AgentRegistry extends EventEmitter {
 		this.stopped = false;
 		this.client.on("disconnected", this.onDisconnected);
 		this.client.on("connected", this.onConnected);
+		this.client.on("event", this.onEvent);
+
+		// Global, pane_id-less subscriptions (verified against a live herdr
+		// server not to require one - unlike pane.agent_status_changed).
+		// Best-effort: a subscribe failure here must not stop start() or
+		// reconcile()/the poll loop, which remains the self-healing backstop
+		// regardless of whether push ever works.
+		try {
+			await this.client.subscribe(LIFECYCLE_SUBSCRIPTIONS);
+		} catch {
+			/* push is an accelerant, not a dependency; poll still covers us. */
+		}
+
 		await this.reconcile();
 		this.scheduleTick();
 	}
@@ -161,6 +228,7 @@ export class AgentRegistry extends EventEmitter {
 		this.timer = undefined;
 		this.client.off("disconnected", this.onDisconnected);
 		this.client.off("connected", this.onConnected);
+		this.client.off("event", this.onEvent);
 	}
 
 	private onDisconnected = (): void => {
@@ -172,14 +240,63 @@ export class AgentRegistry extends EventEmitter {
 		// would make `connected` read true before any post-reconnect data has
 		// arrived, for the whole span of the next agent.list round trip.
 		this.lastReconcileOk = false;
+		// Subscriptions do not survive a new connection - herdr has no
+		// unsubscribe, so the old socket's subscriptions simply die with it.
+		// Clearing this means the next reconcile()'s subscribeNewPanes() will
+		// re-subscribe every still-live pane on the new connection instead of
+		// believing (wrongly) that they're already covered.
+		this.subscribedPanes.clear();
 		this.emit("changed");
 	};
 
 	private onConnected = (): void => {
-		// Finding 2(c): reconcile() is written to never reject, but this
-		// backstop guarantees a future bug there can't become an unhandled
-		// rejection on this fire-and-forget call site.
-		this.reconcile().catch(() => {});
+		// Finding 2(c): reconcile() is written to never reject, but the
+		// try/catch below is a backstop guarantee that a future bug there
+		// can't become an unhandled rejection on this fire-and-forget call
+		// site. The subscribe attempt is wrapped separately for the same
+		// reason as in start(): a failed re-subscribe must not block
+		// reconcile() from running, since poll is the backstop either way.
+		void (async () => {
+			try {
+				await this.client.subscribe(LIFECYCLE_SUBSCRIPTIONS);
+			} catch {
+				/* push is an accelerant, not a dependency; poll still covers us. */
+			}
+			try {
+				await this.reconcile();
+			} catch {
+				/* reconcile() must never throw; defensive backstop, see tick(). */
+			}
+		})();
+	};
+
+	// The second untrusted input path's single entry point (see
+	// parseHerdrEvent above for why). Every pushed event, whatever its shape,
+	// funnels through here: parseHerdrEvent() either returns a validated
+	// event or `undefined`, and `undefined` is a silent no-op - never a
+	// throw, and never a state change built on data that wasn't actually
+	// validated. A lifecycle event (pane created/closed/agent detected)
+	// nudges a reconcile so the poll path picks up the new pane and, in turn,
+	// subscribes to it; a status event only ever updates a pane already
+	// known from a validated agent.list response, never creates one - an
+	// event for an unknown pane is exactly as unauthoritative as an event
+	// with no `pane_id` at all, so both are dropped the same way.
+	private onEvent = (raw: unknown): void => {
+		const event = parseHerdrEvent(raw);
+		if (!event) return;
+
+		if (event.kind === "lifecycle") {
+			// Never let a bug in reconcile() surface as an unhandled rejection
+			// on this fire-and-forget call site (same contract as onConnected).
+			this.reconcile().catch(() => {});
+			return;
+		}
+
+		const existing = this.byPaneId.get(event.paneId);
+		if (!existing) return;
+		if (existing.status === event.status) return;
+		this.byPaneId.set(event.paneId, { ...existing, status: event.status });
+		this.emit("changed");
 	};
 
 	private scheduleTick(): void {
@@ -267,15 +384,49 @@ export class AgentRegistry extends EventEmitter {
 
 		// Recovering from a prior RPC failure is itself a state transition
 		// consumers need to see, even if the agent data looks the same as
-		// what was last (successfully) reconciled.
+		// what was last (successfully) reconciled. differs() must run before
+		// byPaneId is reassigned below, since it compares `next` against the
+		// still-current (pre-reconcile) map.
 		const recovered = !this.lastReconcileOk;
+		const shouldEmit = recovered || this.differs(next);
 		this.lastReconcileOk = true;
+		this.byPaneId = next;
 
-		if (recovered || this.differs(next)) {
-			this.byPaneId = next;
-			this.emit("changed");
-		} else {
-			this.byPaneId = next;
+		// Subscribe to any pane discovered by this reconcile that we haven't
+		// already subscribed to. This is what makes push actually apply to
+		// newly-appeared panes rather than just ones seen since start(): the
+		// per-pane pane.agent_status_changed subscription requires a pane_id
+		// (verified against a live herdr server), so it can only be sent once
+		// a pane is known, i.e. from here - never up front in start().
+		await this.subscribeNewPanes();
+
+		// Finding 5, extended: subscribeNewPanes() awaits a network round
+		// trip. If stop() ran during that await, this reconcile must not
+		// emit after it - byPaneId is already a private, internally
+		// consistent snapshot at this point (assigned synchronously above),
+		// so leaving it in place is fine; only the outward-facing emit is
+		// guarded.
+		if (this.stopped) return;
+
+		if (shouldEmit) this.emit("changed");
+	}
+
+	// herdr has no unsubscribe (see the class-level `subscribedPanes` comment
+	// for the full rationale), so this only ever adds subscriptions for
+	// panes not already tracked. Subscribing is best-effort: if the request
+	// fails, the newly-added ids are rolled back out of `subscribedPanes` so
+	// the next reconcile retries them, rather than the pane silently going
+	// un-pushed forever while still believed subscribed.
+	private async subscribeNewPanes(): Promise<void> {
+		const fresh = [...this.byPaneId.keys()].filter((paneId) => !this.subscribedPanes.has(paneId));
+		if (fresh.length === 0) return;
+		for (const paneId of fresh) this.subscribedPanes.add(paneId);
+		try {
+			await this.client.subscribe(
+				fresh.map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId })),
+			);
+		} catch {
+			for (const paneId of fresh) this.subscribedPanes.delete(paneId);
 		}
 	}
 
