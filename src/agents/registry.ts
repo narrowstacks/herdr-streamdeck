@@ -149,6 +149,31 @@ export class AgentRegistry extends EventEmitter {
 	// Cleared on disconnect (see onDisconnected): subscriptions do not
 	// survive a new connection, so the bookkeeping for the old one is void.
 	private subscribedPanes = new Set<string>();
+	// Finding 1 (round 4) / Finding 2 (round 4): reconcile() has no fewer than
+	// four unsynchronized call sites - tick()'s timer, onConnected, and now a
+	// fire-and-forget call for every pushed lifecycle event - and nothing
+	// upstream guarantees their agent.list round trips resolve in the order
+	// they were sent. Without a guard, a reconcile started earlier (and so
+	// carrying an older, possibly-already-superseded snapshot) can resolve
+	// AFTER a reconcile started later and unconditionally overwrite fresher
+	// state - reverting a pane that's actually `blocked` back to `working`
+	// and telling every consumer about it via "changed". That is exactly the
+	// failure this whole registry exists to prevent.
+	//
+	// The fix is a monotonic sequence number, stamped on each reconcile()
+	// attempt the instant it starts (i.e. in trigger order, not response
+	// order). `appliedSeq` is the sequence number of the last attempt whose
+	// outcome - success OR failure - actually got applied to state.
+	// Immediately after every await inside reconcile() (the agent.list round
+	// trip, and again after subscribeNewPanes()'s own round trip), an attempt
+	// checks whether a strictly newer attempt has already applied since it
+	// started; if so, it discards itself completely - no byPaneId mutation,
+	// no subscribeNewPanes() call (or, if already past that check, no emit) -
+	// rather than clobber data that is, by definition, more current than its
+	// own. Whichever attempt was started MOST RECENTLY always wins, never
+	// whichever happens to answer first.
+	private reconcileSeq = 0;
+	private appliedSeq = 0;
 
 	constructor(
 		private readonly client: HerdrClient,
@@ -325,6 +350,17 @@ export class AgentRegistry extends EventEmitter {
 	protected async reconcile(): Promise<void> {
 		if (this.stopped || !this.client.connected) return;
 
+		// Finding 1/2 (round 4): stamp this attempt with the next sequence
+		// number NOW, synchronously, before any await - so `seq` reflects the
+		// order reconciles were STARTED (which is what "most recent" has to
+		// mean; response order is untrustworthy, see the class-level comment
+		// on reconcileSeq/appliedSeq). Every subsequent checkpoint in this
+		// method compares against `this.appliedSeq` to decide whether a
+		// strictly newer attempt has already applied since this one began -
+		// and if so, discards this attempt's outcome outright rather than
+		// letting older data win a race it has no business winning.
+		const seq = ++this.reconcileSeq;
+
 		// Finding 4 (round 3): the response type is `unknown`, not a lying
 		// `{ agents?: RawAgent[] }` shape - herdr is an external process and
 		// nothing about the JSON-RPC transport guarantees it sends what the
@@ -335,6 +371,14 @@ export class AgentRegistry extends EventEmitter {
 		try {
 			result = await this.client.request<unknown>("agent.list", {});
 		} catch {
+			// Finding 5: an in-flight reconcile whose client.request settled
+			// after stop() must not touch state.
+			if (this.stopped) return;
+			// Finding 1/2 (round 4): a newer attempt already applied its own
+			// outcome (success or failure) while this one was in flight - this
+			// failure is stale news and must not flip a since-recovered
+			// `lastReconcileOk` back to false, nor re-emit over it.
+			if (this.isSuperseded(seq)) return;
 			// Finding 1: a rejected agent.list while the socket stays open
 			// (herdr returned a JSON-RPC {error}) is NOT the same as a
 			// disconnect - onDisconnected already owns clearing state and
@@ -345,6 +389,7 @@ export class AgentRegistry extends EventEmitter {
 			// handles it. Only the "socket fine, RPC failed" case needs
 			// this: without it, `connected` would keep reading true and
 			// `agents` would keep serving pre-failure data forever.
+			this.appliedSeq = seq;
 			this.failReconcile();
 			return;
 		}
@@ -352,6 +397,16 @@ export class AgentRegistry extends EventEmitter {
 		// Finding 5: an in-flight reconcile whose client.request settled
 		// after stop() must not mutate byPaneId or emit.
 		if (this.stopped) return;
+
+		// Finding 1/2 (round 4): the single concurrency checkpoint for a
+		// successful response. A strictly newer reconcile already applied its
+		// outcome while this one's agent.list round trip was in flight -
+		// this is the reviewer's exact repro (a stale `working` snapshot
+		// released after a fresher `blocked` one already landed). Discard
+		// whole: no byPaneId mutation, no malformed-count bump, no
+		// subscribeNewPanes() call, no emit. The reconcile that actually is
+		// newest already (or will) speak for the registry's current state.
+		if (this.isSuperseded(seq)) return;
 
 		// Finding 4 (round 3): the single boundary. Every response shape that
 		// isn't a plain object with an array `agents` property - null,
@@ -363,6 +418,7 @@ export class AgentRegistry extends EventEmitter {
 		// to `AgentListResult`, so no expression that reads into the
 		// response can sit outside this check.
 		if (!isAgentListResult(result)) {
+			this.appliedSeq = seq;
 			this.failReconcile();
 			return;
 		}
@@ -391,6 +447,7 @@ export class AgentRegistry extends EventEmitter {
 		const shouldEmit = recovered || this.differs(next);
 		this.lastReconcileOk = true;
 		this.byPaneId = next;
+		this.appliedSeq = seq;
 
 		// Subscribe to any pane discovered by this reconcile that we haven't
 		// already subscribed to. This is what makes push actually apply to
@@ -408,7 +465,26 @@ export class AgentRegistry extends EventEmitter {
 		// guarded.
 		if (this.stopped) return;
 
+		// Finding 1/2 (round 4): even newer still - a reconcile started after
+		// this one both ran AND applied while subscribeNewPanes()'s own
+		// network round trip was in flight. This one's `shouldEmit` was
+		// computed against a byPaneId snapshot that's no longer current (the
+		// newer attempt already overwrote it and already emitted its own
+		// "changed" for it), so emitting here too would be a stale,
+		// redundant - and potentially misleading - second announcement.
+		if (this.appliedSeq !== seq) return;
+
 		if (shouldEmit) this.emit("changed");
+	}
+
+	// Finding 1/2 (round 4): true when a strictly newer reconcile attempt has
+	// already applied its outcome. `appliedSeq` only ever moves forward
+	// (never reset), so this is a pure "am I stale" check with no ordering
+	// ambiguity: whichever attempt was started most recently is the one
+	// whose outcome should stand, regardless of which one's network round
+	// trip happens to resolve first.
+	private isSuperseded(seq: number): boolean {
+		return seq <= this.appliedSeq;
 	}
 
 	// herdr has no unsubscribe (see the class-level `subscribedPanes` comment
