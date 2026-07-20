@@ -2221,6 +2221,7 @@ git commit -m "feat: add approve/deny decision logic with blocked-state gate"
 
 **Files:**
 - Create: `src/actions/agent-slot.ts`
+- Create: `src/actions/approval-action.ts`
 - Create: `src/actions/approve.ts`
 - Create: `src/actions/deny.ts`
 - Create: `src/plugin-state.ts`
@@ -2287,9 +2288,12 @@ Create `src/plugin-state.ts`:
 ```ts
 import os from "node:os";
 import path from "node:path";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import streamDeck from "@elgato/streamdeck";
 import { AgentRegistry } from "./agents/registry.js";
 import { HerdrClient } from "./herdr/client.js";
+import { DEFAULT_KEYMAP, type KeymapTable } from "./keymap/keymap.js";
 import { SlotAllocator, type SlotAllocatorState } from "./slots/allocator.js";
 
 export const SOCKET_PATH = path.join(os.homedir(), ".config", "herdr", "herdr.sock");
@@ -2321,6 +2325,28 @@ export async function loadSlots(): Promise<void> {
 export async function saveSlots(): Promise<void> {
 	const settings = await streamDeck.settings.getGlobalSettings<GlobalSettings>();
 	await streamDeck.settings.setGlobalSettings({ ...settings, slots: current.toJSON() });
+}
+
+let keymap: KeymapTable = DEFAULT_KEYMAP;
+export function keymapTable(): KeymapTable {
+	return keymap;
+}
+
+/**
+ * Loads the shipped keymap.json so a new agent CLI is a config edit rather
+ * than a rebuild. Falls back to DEFAULT_KEYMAP if the file is missing or
+ * malformed — a broken config must not stop the plugin from starting.
+ */
+export function loadKeymap(): void {
+	const file = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "keymap.json");
+	try {
+		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+		delete parsed._comment;
+		if (parsed.default) keymap = parsed as unknown as KeymapTable;
+		else streamDeck.logger.warn("keymap.json has no 'default' entry; using built-in keymap");
+	} catch (err) {
+		streamDeck.logger.warn(`could not load keymap.json, using built-in keymap: ${err}`);
+	}
 }
 
 export async function startHerdr(): Promise<void> {
@@ -2459,11 +2485,15 @@ Note: verify `instance.isKey()` exists on the union of `DialAction | KeyAction` 
 
 - [ ] **Step 6: Write the Approve and Deny actions**
 
-Create `src/actions/approve.ts`:
+Approve and Deny differ only in which key sequence they send. The send-and-report
+logic lives once in a base class so a later fix to the error handling cannot
+silently miss one of them.
+
+Create `src/actions/approval-action.ts`:
 
 ```ts
-import { action, SingletonAction, type KeyDownEvent } from "@elgato/streamdeck";
-import { client, registry } from "../plugin-state.js";
+import { SingletonAction, type KeyDownEvent } from "@elgato/streamdeck";
+import { client, keymapTable, registry } from "../plugin-state.js";
 import { decideApproval } from "./approval.js";
 import type { KeySequence } from "../keymap/keymap.js";
 
@@ -2472,13 +2502,15 @@ export interface ApprovalSettings {
 	[key: string]: unknown;
 }
 
-@action({ UUID: "com.aaronfa.herdr-agents.approve" })
-export class ApproveAction extends SingletonAction<ApprovalSettings> {
+export abstract class ApprovalActionBase extends SingletonAction<ApprovalSettings> {
+	protected abstract readonly intent: "approve" | "deny";
+
 	override async onKeyDown(ev: KeyDownEvent<ApprovalSettings>): Promise<void> {
 		const decision = decideApproval({
 			connected: registry.connected,
 			focused: registry.focused,
-			intent: "approve",
+			intent: this.intent,
+			table: keymapTable(),
 			override: ev.payload.settings.override,
 		});
 
@@ -2500,41 +2532,36 @@ export class ApproveAction extends SingletonAction<ApprovalSettings> {
 }
 ```
 
-Create `src/actions/deny.ts` — identical except for the UUID and intent:
+Create `src/actions/approve.ts`:
 
 ```ts
-import { action, SingletonAction, type KeyDownEvent } from "@elgato/streamdeck";
-import { client, registry } from "../plugin-state.js";
-import { decideApproval } from "./approval.js";
-import type { ApprovalSettings } from "./approve.js";
+import { action } from "@elgato/streamdeck";
+import { ApprovalActionBase } from "./approval-action.js";
 
-@action({ UUID: "com.aaronfa.herdr-agents.deny" })
-export class DenyAction extends SingletonAction<ApprovalSettings> {
-	override async onKeyDown(ev: KeyDownEvent<ApprovalSettings>): Promise<void> {
-		const decision = decideApproval({
-			connected: registry.connected,
-			focused: registry.focused,
-			intent: "deny",
-			override: ev.payload.settings.override,
-		});
-
-		if (!decision.ok) {
-			await ev.action.showAlert();
-			return;
-		}
-
-		try {
-			await client.request("pane.send_keys", {
-				pane_id: decision.paneId,
-				keys: decision.keys,
-			});
-			await ev.action.showOk();
-		} catch {
-			await ev.action.showAlert();
-		}
-	}
+@action({ UUID: "com.aaronfa.herdr-agents.approve" })
+export class ApproveAction extends ApprovalActionBase {
+	protected readonly intent = "approve" as const;
 }
 ```
+
+Create `src/actions/deny.ts`:
+
+```ts
+import { action } from "@elgato/streamdeck";
+import { ApprovalActionBase } from "./approval-action.js";
+
+@action({ UUID: "com.aaronfa.herdr-agents.deny" })
+export class DenyAction extends ApprovalActionBase {
+	protected readonly intent = "deny" as const;
+}
+```
+
+Note: the `action` decorator returns a subclass, so it must be applied to the
+concrete classes, not to `ApprovalActionBase`. Verify both actions still resolve
+their `manifestId` at runtime during Step 13 — if the decorator does not compose
+with an abstract base in `@elgato/streamdeck` 2.1.0, fall back to a shared
+`handleApproval(ev, intent)` free function called from two flat classes, which
+keeps the logic single-sourced without inheritance.
 
 - [ ] **Step 7: Wire the entrypoint**
 
@@ -2545,7 +2572,9 @@ import streamDeck from "@elgato/streamdeck";
 import { AgentSlotAction } from "./actions/agent-slot.js";
 import { ApproveAction } from "./actions/approve.js";
 import { DenyAction } from "./actions/deny.js";
-import { loadSlots, startHerdr } from "./plugin-state.js";
+import { loadKeymap, loadSlots, startHerdr } from "./plugin-state.js";
+
+loadKeymap();
 
 streamDeck.actions.registerAction(new AgentSlotAction());
 streamDeck.actions.registerAction(new ApproveAction());
@@ -2682,7 +2711,8 @@ Confirm each of these against live herdr, and record the result:
 8. Stop herdr (`herdr server stop`). Within roughly five seconds every slot key shows the "no herdr" disconnected state — **not** a stale colour.
 9. Restart herdr. Keys recover to live state without restarting the Stream Deck app.
 10. Exit an agent. Its slot goes dark but keeps its project label. Restart an agent in the same directory. It returns to the same slot.
-11. Quit and reopen the Stream Deck app. Slot assignments are unchanged — each project returns to the key it was on before. This verifies `loadSlots`/`saveSlots`; if assignments shuffle, global settings are not round-tripping.
+11. Edit `keymap.json` to give one agent a deliberately wrong approve key, restart the plugin, and confirm the wrong key is sent. This proves the shipped config is actually live rather than shadowed by `DEFAULT_KEYMAP`. Restore the correct value afterward.
+12. Quit and reopen the Stream Deck app. Slot assignments are unchanged — each project returns to the key it was on before. This verifies `loadSlots`/`saveSlots`; if assignments shuffle, global settings are not round-tripping.
 
 - [ ] **Step 14: Record the resolved open items in the spec**
 
