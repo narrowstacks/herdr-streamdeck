@@ -81,4 +81,31 @@ describe("SlotAllocator", () => {
 
 		expect(allocator.slotForCwd("/work/dorkroom")).toBe(0);
 	});
+
+	it("preserves slot assignment across unregister/reregister cycles when other free slots exist", () => {
+		const allocator = new SlotAllocator();
+		allocator.registerSlot(0);
+		allocator.registerSlot(1);
+		allocator.registerSlot(2);
+
+		// Claim three projects, filling all slots
+		expect(allocator.claim("/work/alpha")).toBe(0);
+		expect(allocator.claim("/work/beta")).toBe(1);
+		expect(allocator.claim("/work/gamma")).toBe(2);
+
+		// Unregister beta's slot (deck key removed, but assignment stays)
+		allocator.unregisterSlot(1);
+
+		// Register a new slot
+		allocator.registerSlot(3);
+
+		// Beta's original slot (1) is unregistered but reserved. Even though free slot 3 exists,
+		// beta must retain its original assignment when claimed again.
+		expect(allocator.claim("/work/beta")).toBe(1);
+
+		// Verify the full state
+		expect(allocator.slotForCwd("/work/alpha")).toBe(0);
+		expect(allocator.slotForCwd("/work/beta")).toBe(1);
+		expect(allocator.slotForCwd("/work/gamma")).toBe(2);
+	});
 });
