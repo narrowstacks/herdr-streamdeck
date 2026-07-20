@@ -13,6 +13,16 @@ interface Pending {
 	reject: (reason: Error) => void;
 }
 
+// Runtime guard for the JSON-boundary: narrows an arbitrary parsed JSON
+// value down to "plausibly a HerdrResponse frame" (a non-null, non-array
+// object) without casting. `typeof null === "object"` in JS, so the null
+// check is required in addition to the typeof check; arrays are also
+// `typeof "object"` and are excluded too, since a bare JSON array is not a
+// valid protocol frame either.
+function isHerdrFrame(value: unknown): value is HerdrResponse {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export class HerdrClient extends EventEmitter {
 	private socket?: net.Socket;
 	private buffer = "";
@@ -302,14 +312,28 @@ export class HerdrClient extends EventEmitter {
 			this.buffer = this.buffer.slice(index + 1);
 			if (!line.trim()) continue;
 
-			let message: HerdrResponse;
+			let parsed: unknown;
 			try {
-				message = JSON.parse(line) as HerdrResponse;
+				parsed = JSON.parse(line);
 			} catch {
 				this.emit("parseError", line);
 				continue;
 			}
-			this.dispatch(message);
+			// Boundary guard: JSON.parse succeeds on any valid JSON value, not
+			// just objects - `null`, numbers, strings, booleans, and arrays all
+			// parse without throwing, so the catch above never fires for them.
+			// A protocol frame must be a non-null object; anything else (most
+			// dangerously `null`, since `.id` on it throws instead of merely
+			// being undefined) is malformed and is rejected here, at the one
+			// place a parsed frame is trusted, rather than deeper in dispatch()
+			// or its callers - the same single-boundary-validation shape used
+			// elsewhere in this codebase (e.g. AgentRegistry's
+			// isAgentListResult()), instead of patching one bad shape at a time.
+			if (!isHerdrFrame(parsed)) {
+				this.emit("parseError", line);
+				continue;
+			}
+			this.dispatch(parsed);
 		}
 	}
 
