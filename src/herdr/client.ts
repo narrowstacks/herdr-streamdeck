@@ -22,6 +22,12 @@ export class HerdrClient extends EventEmitter {
 	private closed = false;
 	private attempt = 0;
 	private reconnectTimer?: NodeJS.Timeout;
+	// The socket for the connect attempt currently in flight (initial connect
+	// or a reconnect timer that already fired), tracked separately from
+	// `socket` because `socket` is only assigned once onConnect fires. This
+	// lets a second overlapping connect() (Finding 2) or close() (Finding 1)
+	// reach in and kill an attempt that hasn't resolved yet.
+	private connecting?: { socket: net.Socket; reject: (err: Error) => void };
 
 	constructor(private readonly options: HerdrClientOptions) {
 		super();
@@ -39,23 +45,49 @@ export class HerdrClient extends EventEmitter {
 	private openOnce(): Promise<void> {
 		return new Promise<void>((resolve, reject) => {
 			// Defect 2 guard: never allow two live sockets on one client instance.
-			// Detach the prior socket's listeners and destroy it synchronously
-			// (before the new connection even starts) so in-flight data from a
-			// stale connection can never reach onData twice, and reset the
-			// buffer so a fragment from the dead connection can't splice into
-			// the new stream.
+			// Detach the prior established socket's listeners and destroy it
+			// synchronously (before the new connection even starts) so in-flight
+			// data from a stale connection can never reach onData twice, and
+			// reset the buffer so a fragment from the dead connection can't
+			// splice into the new stream.
 			this.detachSocket();
+			// Finding 2 guard: a socket that is still *connecting* (not yet
+			// established) isn't covered by detachSocket() above, since
+			// `this.socket` is only assigned once onConnect fires. Without this,
+			// two overlapping non-awaited connect() calls each start their own
+			// socket and both go on to connect, doubling every pushed message.
+			// Superseding here kills the older attempt and rejects its promise
+			// so the earlier connect() call settles instead of hanging.
+			this.supersedeConnecting(new Error("herdr client: connect() superseded by a newer call"));
 
 			const socket = net.createConnection(this.options.socketPath);
 			socket.setEncoding("utf8");
+			this.connecting = { socket, reject };
 
 			const onError = (err: Error) => {
 				socket.removeListener("connect", onConnect);
+				if (this.connecting?.socket === socket) this.connecting = undefined;
 				this.scheduleReconnect();
 				reject(err);
 			};
 			const onConnect = () => {
 				socket.removeListener("error", onError);
+				if (this.connecting?.socket === socket) this.connecting = undefined;
+
+				// Finding 1 guard: close() may run while this socket - from the
+				// initial connect() or from a reconnect timer that already fired -
+				// is still mid-handshake. detachSocket()/supersedeConnecting() in
+				// close() should normally have already killed it, but this is the
+				// last line of defense: never adopt a socket as live once the
+				// client has been explicitly closed, even if it manages to finish
+				// connecting anyway.
+				if (this.closed) {
+					socket.removeAllListeners();
+					socket.destroy();
+					resolve();
+					return;
+				}
+
 				this.socket = socket;
 				this.isConnected = true;
 				this.attempt = 0;
@@ -83,7 +115,20 @@ export class HerdrClient extends EventEmitter {
 		}
 	}
 
+	private supersedeConnecting(reason: Error): void {
+		const connecting = this.connecting;
+		this.connecting = undefined;
+		if (!connecting) return;
+		connecting.socket.removeAllListeners();
+		connecting.socket.destroy();
+		connecting.reject(reason);
+	}
+
 	private handleDrop(): void {
+		// Finding 1 guard: once close() has run, a "close" event from a socket
+		// that was already being torn down must never re-derive reconnect
+		// state or re-emit "disconnected".
+		if (this.closed) return;
 		if (!this.isConnected) return;
 		this.isConnected = false;
 		this.socket = undefined;
@@ -134,9 +179,11 @@ export class HerdrClient extends EventEmitter {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = undefined;
 		}
-		const socket = this.socket;
-		this.socket = undefined;
-		socket?.destroy();
+		// Finding 1: kill an in-flight connect attempt (initial or a fired
+		// reconnect timer) synchronously, not just the already-established
+		// socket, so it can never resurrect the client after close().
+		this.supersedeConnecting(new Error("herdr client closed"));
+		this.detachSocket();
 		this.failPending(new Error("herdr client closed"));
 	}
 

@@ -48,4 +48,38 @@ describe("HerdrClient double connect", () => {
 
 		expect(server.socketCount).toBe(1);
 	});
+
+	// Finding 2 (Important): the sequential-await tests above cannot reach the
+	// window where two connect() calls are both in flight at once, because
+	// detachSocket() can only detach `this.socket`, which stays undefined
+	// until the *first* call's onConnect fires. Two overlapping, non-awaited
+	// connect() calls therefore each create their own socket, both connect,
+	// and a single pushed message is delivered to the "event" listener twice.
+	it("does not create two live sockets when connect() is called twice concurrently without awaiting", async () => {
+		const socketPath = await server.start();
+		server.onRequest((req) => ({ id: req.id, result: {} }));
+
+		client = new HerdrClient({ socketPath });
+
+		// Neither call is awaited before the next starts: this is the
+		// concurrent window the sequential-await tests above cannot reach.
+		const first = client.connect().catch(() => {
+			/* expected to be superseded by the second call */
+		});
+		const second = client.connect();
+
+		await second;
+		await first;
+		await new Promise((r) => setTimeout(r, 50));
+
+		expect(server.socketCount).toBe(1);
+
+		const received: unknown[] = [];
+		client.on("event", (ev) => received.push(ev));
+
+		server.push({ type: "pane.created", pane_id: "w1-y" });
+		await new Promise((r) => setTimeout(r, 50));
+
+		expect(received).toEqual([{ type: "pane.created", pane_id: "w1-y" }]);
+	});
 });
