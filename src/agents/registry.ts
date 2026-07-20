@@ -63,32 +63,60 @@ const LIFECYCLE_SUBSCRIPTIONS = [
 	{ type: "pane.agent_detected" },
 ];
 
-const LIFECYCLE_EVENT_TYPES = new Set(["pane.created", "pane.closed", "pane.agent_detected"]);
+// Verified against a live herdr server (0.6.9, protocol 13; see
+// .superpowers/sdd/real-herdr-events.md for the captured wire payloads):
+// pushed events are `{ event: "<name>", data: {...} }`, NOT the
+// `{type, pane_id, agent_status}` top-level shape this file was originally
+// written against. The discriminator key is `event`; every field a handler
+// keys on lives under `data`.
+//
+// The delivered `event` name is also inconsistently spelled depending on
+// which subscription produced it, and this is NOT a bug to normalize away:
+// `pane.agent_status_changed` is delivered dotted (matching its subscription
+// name), while `pane.created` / `pane.closed` / `pane.agent_detected` are
+// delivered underscored (`pane_created` / `pane_closed` /
+// `pane_agent_detected`). Both spellings are accepted for every event type
+// below so that a future herdr release settling on either convention (or a
+// dotted `pane_agent_status_changed`, never observed but not ruled out)
+// doesn't silently drop half the events again.
+const LIFECYCLE_EVENT_NAMES = new Set([
+	"pane.created",
+	"pane_created",
+	"pane.closed",
+	"pane_closed",
+	"pane.agent_detected",
+	"pane_agent_detected",
+]);
+
+const STATUS_CHANGED_EVENT_NAMES = new Set(["pane.agent_status_changed", "pane_agent_status_changed"]);
 
 // The second untrusted input path (the first being agent.list's response,
 // guarded by isAgentListResult above). A pushed event is whatever herdr
 // wrote to the socket, parsed as JSON with zero shape guarantee - it can be
-// null, a primitive, an array, an object missing `type`, or a
-// pane.agent_status_changed with a missing/non-string pane_id. This is the
-// SOLE place that reads into a pushed event's fields, mirroring
-// isAgentListResult(): every field access (`type`, `pane_id`, `agent_status`)
-// happens here, once, behind typeof/null checks, and nothing downstream
-// (onEvent) reads the raw payload directly.
+// null, a primitive, an array, an object missing `event`/`data`, or a
+// pane.agent_status_changed whose `data` is missing/non-object or has a
+// missing/non-string pane_id. This is the SOLE place that reads into a
+// pushed event's fields, mirroring isAgentListResult(): every field access
+// (`event`, `data`, `pane_id`, `agent_status`) happens here, once, behind
+// typeof/null checks, and nothing downstream (onEvent) reads the raw
+// payload directly.
 type ParsedHerdrEvent =
 	| { kind: "lifecycle" }
 	| { kind: "status"; paneId: string; status: AgentStatus };
 
 function parseHerdrEvent(value: unknown): ParsedHerdrEvent | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
-	const type = (value as { type?: unknown }).type;
-	if (typeof type !== "string") return undefined;
+	const eventName = (value as { event?: unknown }).event;
+	if (typeof eventName !== "string") return undefined;
+	const data = (value as { data?: unknown }).data;
+	if (typeof data !== "object" || data === null) return undefined;
 
-	if (LIFECYCLE_EVENT_TYPES.has(type)) return { kind: "lifecycle" };
+	if (LIFECYCLE_EVENT_NAMES.has(eventName)) return { kind: "lifecycle" };
 
-	if (type === "pane.agent_status_changed") {
-		const paneId = (value as { pane_id?: unknown }).pane_id;
+	if (STATUS_CHANGED_EVENT_NAMES.has(eventName)) {
+		const paneId = (data as { pane_id?: unknown }).pane_id;
 		if (typeof paneId !== "string" || paneId.length === 0) return undefined;
-		const agentStatus = (value as { agent_status?: unknown }).agent_status;
+		const agentStatus = (data as { agent_status?: unknown }).agent_status;
 		return {
 			kind: "status",
 			paneId,

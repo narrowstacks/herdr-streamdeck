@@ -30,6 +30,29 @@ const CLAUDE = {
 	workspace_id: "w1",
 };
 
+// Real captured wire payload for a lifecycle push (see
+// .superpowers/sdd/real-herdr-events.md) - used here only as a trigger to
+// nudge reconcile(); the concurrency behavior under test doesn't care which
+// lifecycle event it is, but the payload must be shaped like a real one for
+// the corrected parseHerdrEvent to recognize it at all.
+const PANE_CREATED_EVENT = {
+	data: {
+		pane: {
+			agent_status: "unknown",
+			cwd: "/Users/aaron/workspace/claude-control-streamdeck",
+			focused: false,
+			foreground_cwd: "/Users/aaron/workspace/claude-control-streamdeck",
+			pane_id: "w65704613465d81-2",
+			revision: 0,
+			tab_id: "w65704613465d81:1",
+			terminal_id: "term_65706ba33ce0425",
+			workspace_id: "w65704613465d81",
+		},
+		type: "pane_created",
+	},
+	event: "pane_created",
+};
+
 async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
 	const start = Date.now();
 	while (!predicate()) {
@@ -87,13 +110,13 @@ describe("AgentRegistry reconcile concurrency", () => {
 		expect(registry.agents[0].status).toBe("working");
 
 		// Lifecycle push A -> reconcile #2, held.
-		server.push({ type: "pane.created" });
+		server.push(PANE_CREATED_EVENT);
 		await waitUntil(() => agentListCount >= 2);
 		expect(heldReq).toBeDefined();
 
 		// Lifecycle push B -> reconcile #3, answered immediately with
 		// "blocked" - the true current state. The registry must pick this up.
-		server.push({ type: "pane.created" });
+		server.push(PANE_CREATED_EVENT);
 		await waitUntil(() => registry.getByPaneId("w1-1")?.status === "blocked");
 
 		let sawRevert = false;
@@ -153,11 +176,11 @@ describe("AgentRegistry reconcile concurrency", () => {
 		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
 		await registry.start();
 
-		server.push({ type: "pane.created" });
+		server.push(PANE_CREATED_EVENT);
 		await waitUntil(() => agentListCount >= 2);
 		expect(heldReq).toBeDefined();
 
-		server.push({ type: "pane.created" });
+		server.push(PANE_CREATED_EVENT);
 		await waitUntil(() => registry.getByPaneId("w1-2") !== undefined);
 
 		heldSocket!.write(
@@ -210,11 +233,11 @@ describe("AgentRegistry reconcile concurrency", () => {
 		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
 		await registry.start();
 
-		server.push({ type: "pane.created" });
+		server.push(PANE_CREATED_EVENT);
 		await waitUntil(() => agentListCount >= 2);
 		expect(heldReq).toBeDefined();
 
-		server.push({ type: "pane.created" });
+		server.push(PANE_CREATED_EVENT);
 		await waitUntil(() => registry.getByPaneId("w1-3") !== undefined);
 
 		// Release A's held response now, carrying a snapshot the newer

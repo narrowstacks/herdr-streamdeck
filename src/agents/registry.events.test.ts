@@ -13,6 +13,86 @@ const CLAUDE = {
 	workspace_id: "w1",
 };
 
+// Verbatim wire payloads captured from a live herdr 0.6.9 server (protocol
+// 13) - see .superpowers/sdd/real-herdr-events.md. The pushed-event handler
+// was originally written against an invented `{type, pane_id, agent_status}`
+// top-level shape that herdr never actually sends; every event test in this
+// file must exercise the REAL shape (`{event, data}`) or it proves nothing.
+
+// The exact bytes from the reference doc, byte-for-byte, against the exact
+// pane/workspace ids they were captured with - proves the parser handles the
+// literal captured payload, not just a shape that resembles it.
+const REAL_CAPTURED_STATUS_CHANGED_BLOCKED = {
+	data: {
+		agent: "claude",
+		agent_status: "blocked",
+		pane_id: "w65704613465d81-2",
+		workspace_id: "w65704613465d81",
+	},
+	event: "pane.agent_status_changed",
+};
+
+// Same verified structure (dotted `event` name, fields under `data`, no
+// `data.type`), parameterized so it can target the `w1-1`/`w1` fixtures the
+// rest of this suite (and registry.test.ts) already use.
+function statusChangedEvent(paneId: string, status: string, workspaceId = "w1") {
+	return {
+		data: { agent: "claude", agent_status: status, pane_id: paneId, workspace_id: workspaceId },
+		event: "pane.agent_status_changed",
+	};
+}
+
+// Real captured `pane_created` payload - underscored event name, and pane
+// fields nested one level deeper under `data.pane` (unlike every other
+// event, whose fields sit directly under `data`).
+const REAL_PANE_CREATED = {
+	data: {
+		pane: {
+			agent_status: "unknown",
+			cwd: "/Users/aaron/workspace/claude-control-streamdeck",
+			focused: false,
+			foreground_cwd: "/Users/aaron/workspace/claude-control-streamdeck",
+			pane_id: "w65704613465d81-2",
+			revision: 0,
+			tab_id: "w65704613465d81:1",
+			terminal_id: "term_65706ba33ce0425",
+			workspace_id: "w65704613465d81",
+		},
+		type: "pane_created",
+	},
+	event: "pane_created",
+};
+
+// Real captured `pane_closed` payload - underscored event name.
+const REAL_PANE_CLOSED = {
+	data: { pane_id: "w65704613465d81-2", type: "pane_closed", workspace_id: "w65704613465d81" },
+	event: "pane_closed",
+};
+
+// Real captured `pane_agent_detected` payload - underscored event name.
+const REAL_PANE_AGENT_DETECTED = {
+	data: { agent: "claude", pane_id: "w65704613465d81-1", type: "pane_agent_detected", workspace_id: "w65704613465d81" },
+	event: "pane_agent_detected",
+};
+
+// Never observed on the wire, but the naming table in the reference doc
+// requires both spellings be accepted for every event type, not just the
+// ones actually captured - a herdr release that settles on the dotted form
+// for lifecycle events (or the underscored form for status changes) must not
+// silently regress this.
+const DOTTED_PANE_CLOSED = {
+	data: { pane_id: "w1-1", type: "pane_closed", workspace_id: "w1" },
+	event: "pane.closed",
+};
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+	const start = Date.now();
+	while (!predicate()) {
+		if (Date.now() - start > timeoutMs) throw new Error("waitUntil timed out");
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
+
 describe("AgentRegistry subscriptions", () => {
 	let server: FakeHerdrServer;
 	let client: HerdrClient;
@@ -54,7 +134,7 @@ describe("AgentRegistry subscriptions", () => {
 		expect(subs).toContainEqual({ type: "pane.agent_status_changed", pane_id: "w1-1" });
 	});
 
-	it("applies a pushed status change without waiting for the reconcile tick", async () => {
+	it("applies a pushed status change without waiting for the reconcile tick (real captured payload)", async () => {
 		const socketPath = await server.start();
 		server.onRequest((req) => {
 			if (req.method === "agent.list") {
@@ -70,14 +150,43 @@ describe("AgentRegistry subscriptions", () => {
 		expect(registry.agents[0].status).toBe("working");
 
 		const changed = new Promise<void>((resolve) => registry.once("changed", resolve));
-		server.push({
-			type: "pane.agent_status_changed",
-			pane_id: "w1-1",
-			agent_status: "blocked",
-		});
+		// Real captured shape: {event, data}, not the invented top-level
+		// {type, pane_id, agent_status}.
+		server.push(statusChangedEvent("w1-1", "blocked"));
 		await changed;
 
 		expect(registry.getByPaneId("w1-1")?.status).toBe("blocked");
+	});
+
+	it("applies the literal captured pane.agent_status_changed payload end to end", async () => {
+		const socketPath = await server.start();
+		const CAPTURED_PANE = {
+			agent: "claude",
+			agent_status: "working",
+			cwd: "/work/captured",
+			focused: true,
+			pane_id: "w65704613465d81-2",
+			workspace_id: "w65704613465d81",
+		};
+		server.onRequest((req) => {
+			if (req.method === "agent.list") {
+				return { id: req.id, result: { agents: [CAPTURED_PANE], type: "agent_list" } };
+			}
+			return { id: req.id, result: { type: "subscription_started" } };
+		});
+
+		client = new HerdrClient({ socketPath });
+		await client.connect();
+		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
+		await registry.start();
+		expect(registry.getByPaneId("w65704613465d81-2")?.status).toBe("working");
+
+		const changed = new Promise<void>((resolve) => registry.once("changed", resolve));
+		// The exact bytes from real-herdr-events.md, unmodified.
+		server.push(REAL_CAPTURED_STATUS_CHANGED_BLOCKED);
+		await changed;
+
+		expect(registry.getByPaneId("w65704613465d81-2")?.status).toBe("blocked");
 	});
 
 	it("ignores a status event for an unknown pane", async () => {
@@ -94,7 +203,7 @@ describe("AgentRegistry subscriptions", () => {
 		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
 		await registry.start();
 
-		server.push({ type: "pane.agent_status_changed", pane_id: "ghost", agent_status: "blocked" });
+		server.push(statusChangedEvent("ghost", "blocked"));
 		await new Promise((r) => setTimeout(r, 20));
 
 		expect(registry.getByPaneId("ghost")).toBeUndefined();
@@ -141,10 +250,48 @@ describe("AgentRegistry subscriptions", () => {
 		await registry.start();
 
 		const changed = new Promise<void>((resolve) => registry.once("changed", resolve));
-		server.push({ type: "pane.agent_status_changed", pane_id: "w1-1", agent_status: "totally-not-a-status" });
+		server.push(statusChangedEvent("w1-1", "totally-not-a-status"));
 		await changed;
 
 		expect(registry.getByPaneId("w1-1")?.status).toBe("unknown");
+	});
+
+	it("accepts both the underscored (as-delivered) and dotted spellings of lifecycle events", async () => {
+		const socketPath = await server.start();
+		let agentListCount = 0;
+		server.onRequest((req) => {
+			if (req.method === "agent.list") {
+				agentListCount++;
+				return { id: req.id, result: { agents: [CLAUDE], type: "agent_list" } };
+			}
+			return { id: req.id, result: { type: "subscription_started" } };
+		});
+
+		client = new HerdrClient({ socketPath });
+		await client.connect();
+		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
+		await registry.start();
+		await waitUntil(() => agentListCount >= 1);
+
+		// As actually delivered by herdr: underscored `pane_created`,
+		// `pane_closed`, `pane_agent_detected`.
+		const beforeUnderscored = agentListCount;
+		server.push(REAL_PANE_CREATED);
+		await waitUntil(() => agentListCount > beforeUnderscored);
+
+		const beforeUnderscored2 = agentListCount;
+		server.push(REAL_PANE_CLOSED);
+		await waitUntil(() => agentListCount > beforeUnderscored2);
+
+		const beforeUnderscored3 = agentListCount;
+		server.push(REAL_PANE_AGENT_DETECTED);
+		await waitUntil(() => agentListCount > beforeUnderscored3);
+
+		// Never observed on the wire, but must still be accepted: a dotted
+		// spelling for an event herdr currently only delivers underscored.
+		const beforeDotted = agentListCount;
+		server.push(DOTTED_PANE_CLOSED);
+		await waitUntil(() => agentListCount > beforeDotted);
 	});
 
 	it("does not throw and does not corrupt state on malformed pushed event payloads", async () => {
@@ -181,34 +328,48 @@ describe("AgentRegistry subscriptions", () => {
 			client.emit("event", ["not", "an", "object"]);
 
 			// Object-shaped malformed payloads delivered over the real wire.
-			// object with no `type` at all
+			// object with no `event` at all
 			server.push({});
-			// pane.agent_status_changed missing pane_id entirely
-			server.push({ type: "pane.agent_status_changed" });
+			// `event` present but `data` missing entirely
+			server.push({ event: "pane.agent_status_changed" });
+			// `event` present but `data` is not an object
+			server.push({ event: "pane.agent_status_changed", data: "not an object" });
+			// `event` present but `data` is null
+			server.push({ event: "pane.agent_status_changed", data: null });
+			// pane.agent_status_changed missing pane_id entirely inside data
+			server.push({ event: "pane.agent_status_changed", data: { agent_status: "blocked" } });
 			// pane.agent_status_changed with a non-string pane_id
-			server.push({ type: "pane.agent_status_changed", pane_id: 42, agent_status: "blocked" });
+			server.push({ event: "pane.agent_status_changed", data: { pane_id: 42, agent_status: "blocked" } });
 			// pane.agent_status_changed with a non-string pane_id (object)
-			server.push({ type: "pane.agent_status_changed", pane_id: { nested: true }, agent_status: "blocked" });
+			server.push({
+				event: "pane.agent_status_changed",
+				data: { pane_id: { nested: true }, agent_status: "blocked" },
+			});
 			// pane.agent_status_changed with a null pane_id
-			server.push({ type: "pane.agent_status_changed", pane_id: null, agent_status: "blocked" });
-			// unrecognized event type entirely
-			server.push({ type: "pane.something_else", pane_id: "w1-1" });
+			server.push({ event: "pane.agent_status_changed", data: { pane_id: null, agent_status: "blocked" } });
+			// unrecognized event name entirely
+			server.push({ event: "pane.something_else", data: { pane_id: "w1-1" } });
+			// THE PINNED REGRESSION: a well-formed-looking payload in the OLD,
+			// INVENTED top-level shape this handler was originally (wrongly)
+			// written against. herdr never actually sends this - it must be
+			// rejected, not silently accepted as if it were the real shape.
+			server.push({ type: "pane.agent_status_changed", pane_id: "w1-1", agent_status: "blocked" });
 
 			// Give the socket a beat to deliver everything and for any handler
 			// to run (and, if unguarded, to throw/crash).
 			await new Promise((resolve) => setTimeout(resolve, 30));
 
 			// None of the malformed events should have mutated state: status
-			// must still be "working", not "blocked" from the malformed
-			// pane_id: 42 / pane_id: {nested:true} / pane_id: null payloads,
-			// and no new pane should have appeared.
+			// must still be "working", not "blocked" from any of the malformed
+			// payloads above (including the old-shape one), and no new pane
+			// should have appeared.
 			expect(registry.agents).toHaveLength(1);
 			expect(registry.getByPaneId("w1-1")?.status).toBe("working");
 
 			// The event listener must still be alive and functioning after
 			// absorbing all of the above - proves nothing wedged or detached.
 			const changed = new Promise<void>((resolve) => registry.once("changed", resolve));
-			server.push({ type: "pane.agent_status_changed", pane_id: "w1-1", agent_status: "blocked" });
+			server.push(statusChangedEvent("w1-1", "blocked"));
 			await changed;
 			expect(registry.getByPaneId("w1-1")?.status).toBe("blocked");
 
