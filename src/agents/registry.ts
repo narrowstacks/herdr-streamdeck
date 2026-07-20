@@ -376,7 +376,18 @@ export class AgentRegistry extends EventEmitter {
 	}
 
 	protected async reconcile(): Promise<void> {
-		if (this.stopped || !this.client.connected) return;
+		// Forced by the new HerdrClient split: `client.connected` now reflects
+		// only the long-lived event-stream connection, not whether requests can
+		// succeed - `agent.list` goes out over its own independent one-shot
+		// connection (see HerdrClient.request()). Gating reconcile() on
+		// `client.connected` the way this used to would silently stop the poll
+		// backstop for as long as the event stream is reconnecting - exactly
+		// the window push is least reliable in, and exactly what "the tick
+		// guarantees the plugin cannot sit permanently stale" (see the design
+		// doc's State synchronization section) requires NOT to happen. A
+		// request that genuinely can't reach herdr still fails on its own,
+		// below, and is handled the same as any other reconcile failure.
+		if (this.stopped) return;
 
 		// Finding 1/2 (round 4): stamp this attempt with the next sequence
 		// number NOW, synchronously, before any await - so `seq` reflects the
@@ -407,16 +418,20 @@ export class AgentRegistry extends EventEmitter {
 			// failure is stale news and must not flip a since-recovered
 			// `lastReconcileOk` back to false, nor re-emit over it.
 			if (this.isSuperseded(seq)) return;
-			// Finding 1: a rejected agent.list while the socket stays open
-			// (herdr returned a JSON-RPC {error}) is NOT the same as a
-			// disconnect - onDisconnected already owns clearing state and
-			// emitting "changed" for that case. If the drop DID happen
-			// mid-request instead, client.connected is already false by now
-			// (HerdrClient flips it before rejecting pending requests), so
-			// failReconcile() below is a no-op there and onDisconnected
-			// handles it. Only the "socket fine, RPC failed" case needs
-			// this: without it, `connected` would keep reading true and
-			// `agents` would keep serving pre-failure data forever.
+			// Finding 1, updated for the two-path HerdrClient: agent.list now
+			// goes out on its own independent one-shot connection (see
+			// HerdrClient.request()), so a rejection here - for ANY reason: a
+			// JSON-RPC {error}, a malformed response, or the one-shot
+			// connection itself failing - never touches `client.connected`
+			// (which reflects only the separate long-lived event-stream
+			// connection). That's exactly why this path still needs its own
+			// handling rather than assuming onDisconnected already covered it:
+			// the event stream can be perfectly healthy while this one request
+			// fails on its own. failReconcile() below is what flips
+			// `lastReconcileOk` and emits for that case; if the event stream
+			// happens to ALSO be down, its own guard (`this.client.connected`
+			// inside failReconcile()) makes this a no-op there, since
+			// onDisconnected already cleared state and emitted for that.
 			this.appliedSeq = seq;
 			this.failReconcile();
 			return;

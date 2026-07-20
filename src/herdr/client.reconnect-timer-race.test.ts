@@ -1,17 +1,21 @@
-import type net from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HerdrClient } from "./client.js";
 import { FakeHerdrServer } from "./fake-server.js";
 
-// Finding 1 (Important): scheduleReconnect()/reconnectTimer and manual
-// connect()/connectingPromise don't coordinate. A socket drop arms
-// reconnectTimer for a backoff delay. If a manual connect() during that
-// window succeeds *before* the timer fires, the client is genuinely live -
-// but nothing cancels the now-stale timer. When it later fires, openOnce()
-// calls detachSocket() unconditionally, destroying the good live socket and
-// replacing it with a brand new one, without ever calling failPending() -
-// so a request in flight on the good socket is orphaned forever, and
-// "connected" fires a spurious second time with no matching "disconnected".
+// scheduleReconnect()/reconnectTimer and a manual reconnect don't
+// automatically coordinate on their own - a drop arms reconnectTimer for a
+// backoff delay, and if a manual reconnect during that window succeeds
+// *before* the timer fires, the client is genuinely live again. Nothing
+// should let the now-stale timer fire later and tear down that good
+// connection to replace it with a redundant new one.
+//
+// The old version of this test proved "the good connection survives" via a
+// request left in flight on it - meaningless now that request() is its own
+// one-shot connection, entirely unrelated to the event connection this race
+// is about. This version proves the same property (no stale second
+// reconnect) via the event connection itself: connectCount stays at 1, and
+// a push sent well after the stale timer's original deadline is still
+// delivered on the one surviving connection.
 describe("HerdrClient reconnect timer race", () => {
 	let server: FakeHerdrServer;
 	let client: HerdrClient;
@@ -25,39 +29,30 @@ describe("HerdrClient reconnect timer race", () => {
 		await server.stop();
 	});
 
-	it("does not let a stale reconnect timer tear down a good connection established by a manual connect() during the backoff window", async () => {
+	it("does not let a stale reconnect timer tear down a good connection established by a manual reconnect during the backoff window", async () => {
 		const socketPath = await server.start();
-
-		// Every request except "agent.list" gets an immediate reply. The
-		// "agent.list" request's server-side socket is captured instead, so
-		// the test can reply to it manually, well after the original stale
-		// timer's delay would have elapsed - proving the reply still lands on
-		// a live connection rather than being lost to a swapped-out socket.
-		let captured: { id: string; socket: net.Socket } | undefined;
-		server.onRequest((req, socket) => {
-			if (req.method === "agent.list") {
-				captured = { id: req.id, socket };
-				return undefined;
-			}
-			return { id: req.id, result: {} };
-		});
+		server.onRequest((req) => ({ id: req.id, result: { type: "subscription_started" } }));
 
 		client = new HerdrClient({ socketPath, reconnectBaseMs: 300, reconnectMaxMs: 1000 });
-		await client.connect();
+		await client.subscribe([{ type: "pane.created" }]);
 
 		let connectCount = 0;
 		client.on("connected", () => connectCount++);
 
 		// Drop the connection: this arms reconnectTimer for a 300ms delay.
+		const disconnected = new Promise<void>((resolve) => client.once("disconnected", resolve));
 		server.dropConnections();
+		await disconnected;
 
 		// Manually reconnect mid-backoff, well before the 300ms timer fires.
 		await new Promise((r) => setTimeout(r, 20));
 		await client.connect();
 
 		expect(connectCount).toBe(1); // the manual reconnect's own "connected"
+		expect(server.socketCount).toBe(1);
 
-		const inFlight = client.request<{ ok: boolean }>("agent.list", {});
+		const received: unknown[] = [];
+		client.on("event", (ev) => received.push(ev));
 
 		// Wait past the ORIGINAL stale timer's 300ms delay (measured from the
 		// drop, ~280ms from here) so it would have already fired if unfixed.
@@ -66,16 +61,16 @@ describe("HerdrClient reconnect timer race", () => {
 		// (a) no spurious second "connected" from the stale timer resurrecting
 		// a new socket.
 		expect(connectCount).toBe(1);
-		// (b) the connection is still live.
+		// (b) the connection is still live, and still exactly one socket.
 		expect(client.connected).toBe(true);
+		expect(server.socketCount).toBe(1);
 
-		// Reply now, deliberately after the stale timer's delay has passed:
-		// if the stale timer swapped the socket, this write lands on a
-		// closed/discarded server-side socket and is lost.
-		expect(captured).toBeDefined();
-		captured!.socket.write(JSON.stringify({ id: captured!.id, result: { ok: true } }) + "\n");
-
-		// (c) the request settles rather than hanging forever.
-		await expect(inFlight).resolves.toEqual({ ok: true });
+		// (c) a push sent now still reaches this connection - if the stale
+		// timer had swapped the socket, either this delivery would be lost
+		// (pushed to a socket nothing is listening through anymore) or a
+		// second, orphaned connection would exist server-side.
+		server.push({ event: "pane_created", data: { pane: { pane_id: "w1-late" } } });
+		await new Promise((r) => setTimeout(r, 20));
+		expect(received).toEqual([{ event: "pane_created", data: { pane: { pane_id: "w1-late" } } }]);
 	});
 });
