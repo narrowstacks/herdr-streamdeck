@@ -82,4 +82,38 @@ describe("HerdrClient double connect", () => {
 
 		expect(received).toEqual([{ type: "pane.created", pane_id: "w1-y" }]);
 	});
+
+	// Important finding: supersede-and-reject fixed the duplicate-socket bug
+	// above, but it did so by rejecting the *first* caller's connect()
+	// promise. Realistic defensive init code
+	// (`client.connect(); await client.connect();`) never awaits or catches
+	// that first promise, so under plain `node` with default
+	// --unhandled-rejections=throw, the superseded rejection crashes the
+	// whole process - worse than the bug it replaced, since a crash blanks
+	// every Stream Deck key instead of leaving one stale. Deliberately no
+	// `.catch()` is attached to the first call here: that's exactly what
+	// masked the bug in the test above.
+	it("does not produce an unhandled rejection when a non-awaited connect() is followed by a second connect()", async () => {
+		const socketPath = await server.start();
+		server.onRequest((req) => ({ id: req.id, result: {} }));
+
+		client = new HerdrClient({ socketPath });
+
+		const unhandled: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandledRejection);
+
+		try {
+			client.connect(); // deliberately not awaited, not caught
+			await client.connect();
+
+			// Give any stray rejection a chance to surface as an
+			// unhandledRejection event before we assert.
+			await new Promise((r) => setTimeout(r, 100));
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+
+		expect(unhandled).toEqual([]);
+	});
 });

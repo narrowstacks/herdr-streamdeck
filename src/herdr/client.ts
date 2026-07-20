@@ -24,10 +24,25 @@ export class HerdrClient extends EventEmitter {
 	private reconnectTimer?: NodeJS.Timeout;
 	// The socket for the connect attempt currently in flight (initial connect
 	// or a reconnect timer that already fired), tracked separately from
-	// `socket` because `socket` is only assigned once onConnect fires. This
-	// lets a second overlapping connect() (Finding 2) or close() (Finding 1)
-	// reach in and kill an attempt that hasn't resolved yet.
-	private connecting?: { socket: net.Socket; reject: (err: Error) => void };
+	// `socket` because `socket` is only assigned once onConnect fires. `settle`
+	// is that attempt's own promise-executor `resolve`, kept so close() can
+	// settle the shared promise below directly - bypassing socket events
+	// entirely - once it has stripped the socket's listeners (see
+	// settleConnectingOnClose()).
+	private connecting?: { socket: net.Socket; settle: () => void };
+	// The promise for whichever connect attempt is currently in flight.
+	// connect() (and the reconnect-timer path, both via openOnce()) return
+	// this SAME promise object to every caller while an attempt is pending,
+	// instead of starting a second attempt and rejecting the first. This
+	// replaces an earlier "supersede-and-reject" design: rejecting a
+	// superseded caller's promise is fine if it's awaited/caught, but
+	// realistic defensive code like `client.connect(); await
+	// client.connect();` never touches the first promise, so the rejection
+	// went unhandled and crashed the process under Node's default
+	// --unhandled-rejections=throw. Sharing one promise means every caller
+	// observes the same outcome: resolve if it connects, reject only on a
+	// genuine connection failure.
+	private connectingPromise?: Promise<void>;
 
 	constructor(private readonly options: HerdrClientOptions) {
 		super();
@@ -37,13 +52,25 @@ export class HerdrClient extends EventEmitter {
 		return this.isConnected;
 	}
 
-	async connect(): Promise<void> {
+	// Not `async`: this must return the exact same Promise object on every
+	// call while an attempt is in flight (see openOnce()), not a wrapper
+	// promise that merely adopts its state. An `async` method would allocate
+	// a fresh wrapper promise per call, and an unhandled rejection on *that*
+	// wrapper is exactly the failure mode this fix removes.
+	connect(): Promise<void> {
 		this.closed = false;
-		await this.openOnce();
+		return this.openOnce();
 	}
 
 	private openOnce(): Promise<void> {
-		return new Promise<void>((resolve, reject) => {
+		// Important finding fix: if an attempt is already in flight (from an
+		// overlapping connect() call, or from a reconnect timer that just
+		// fired while a manual connect() was still pending), hand back that
+		// same promise instead of starting a second attempt. Both callers
+		// then share one outcome, and only one socket is ever created.
+		if (this.connectingPromise) return this.connectingPromise;
+
+		const promise = new Promise<void>((resolve, reject) => {
 			// Defect 2 guard: never allow two live sockets on one client instance.
 			// Detach the prior established socket's listeners and destroy it
 			// synchronously (before the new connection even starts) so in-flight
@@ -51,18 +78,10 @@ export class HerdrClient extends EventEmitter {
 			// reset the buffer so a fragment from the dead connection can't
 			// splice into the new stream.
 			this.detachSocket();
-			// Finding 2 guard: a socket that is still *connecting* (not yet
-			// established) isn't covered by detachSocket() above, since
-			// `this.socket` is only assigned once onConnect fires. Without this,
-			// two overlapping non-awaited connect() calls each start their own
-			// socket and both go on to connect, doubling every pushed message.
-			// Superseding here kills the older attempt and rejects its promise
-			// so the earlier connect() call settles instead of hanging.
-			this.supersedeConnecting(new Error("herdr client: connect() superseded by a newer call"));
 
 			const socket = net.createConnection(this.options.socketPath);
 			socket.setEncoding("utf8");
-			this.connecting = { socket, reject };
+			this.connecting = { socket, settle: resolve };
 
 			const onError = (err: Error) => {
 				socket.removeListener("connect", onConnect);
@@ -76,9 +95,9 @@ export class HerdrClient extends EventEmitter {
 
 				// Finding 1 guard: close() may run while this socket - from the
 				// initial connect() or from a reconnect timer that already fired -
-				// is still mid-handshake. detachSocket()/supersedeConnecting() in
-				// close() should normally have already killed it, but this is the
-				// last line of defense: never adopt a socket as live once the
+				// is still mid-handshake. settleConnectingOnClose()/detachSocket()
+				// in close() should normally have already killed it, but this is
+				// the last line of defense: never adopt a socket as live once the
 				// client has been explicitly closed, even if it manages to finish
 				// connecting anyway.
 				if (this.closed) {
@@ -102,6 +121,20 @@ export class HerdrClient extends EventEmitter {
 			socket.once("error", onError);
 			socket.once("connect", onConnect);
 		});
+
+		this.connectingPromise = promise;
+		// Clear the in-flight marker once this attempt settles, so the next
+		// connect() (or fired reconnect timer) starts a fresh attempt rather
+		// than reusing a decided outcome forever. Attached with a
+		// non-throwing pair of handlers (not `.finally()`, which re-throws
+		// and would itself become a second, unhandled rejected promise) so
+		// this bookkeeping can never surface as its own unhandled rejection.
+		const clearIfCurrent = () => {
+			if (this.connectingPromise === promise) this.connectingPromise = undefined;
+		};
+		promise.then(clearIfCurrent, clearIfCurrent);
+
+		return promise;
 	}
 
 	private detachSocket(): void {
@@ -115,13 +148,36 @@ export class HerdrClient extends EventEmitter {
 		}
 	}
 
-	private supersedeConnecting(reason: Error): void {
+	// close()-during-connect design decision: this RESOLVES the shared
+	// in-flight promise rather than rejecting it. A genuine connection
+	// failure (bad socket path, refused connection) is still a real error
+	// and should reject - that path is unchanged, in onError above. But a
+	// close() racing an in-flight attempt is not the connect() call's own
+	// failure: the caller didn't do anything wrong, and the client's own
+	// onConnect guard already treats "connected anyway after close()" as a
+	// non-error (resolve(), not reject()) for the same reason. Rejecting
+	// here instead would reintroduce the exact bug this fix removes, just
+	// relocated to close(): `client.connect(); client.close();` with the
+	// connect() promise never awaited/caught is at least as realistic as the
+	// original superseded-connect() case, and a reject here would again be
+	// an unhandled rejection for a caller who did nothing wrong. Resolving
+	// keeps both close()-interrupt outcomes (destroyed mid-handshake here,
+	// or connects-anyway in the onConnect guard) consistent regardless of
+	// how far the handshake got when close() ran.
+	//
+	// connectingPromise is cleared synchronously (not left to the
+	// then()-based cleanup in openOnce(), which only runs as a microtask)
+	// so that a connect() called immediately after close() - in the same
+	// synchronous turn - starts a genuine fresh attempt instead of reusing
+	// this decided-by-close() promise.
+	private settleConnectingOnClose(): void {
 		const connecting = this.connecting;
 		this.connecting = undefined;
+		this.connectingPromise = undefined;
 		if (!connecting) return;
 		connecting.socket.removeAllListeners();
 		connecting.socket.destroy();
-		connecting.reject(reason);
+		connecting.settle();
 	}
 
 	private handleDrop(): void {
@@ -182,7 +238,7 @@ export class HerdrClient extends EventEmitter {
 		// Finding 1: kill an in-flight connect attempt (initial or a fired
 		// reconnect timer) synchronously, not just the already-established
 		// socket, so it can never resurrect the client after close().
-		this.supersedeConnecting(new Error("herdr client closed"));
+		this.settleConnectingOnClose();
 		this.detachSocket();
 		this.failPending(new Error("herdr client closed"));
 	}
