@@ -3,6 +3,10 @@ import { AgentSlotAction } from "./actions/agent-slot.js";
 import { ApproveAction } from "./actions/approve.js";
 import { DenyAction } from "./actions/deny.js";
 import { loadKeymap, loadSlots, startHerdr } from "./plugin-state.js";
+import { installUnhandledRejectionNet } from "./unhandled-rejection.js";
+
+// See unhandled-rejection.ts for why this exists and why it's extracted.
+installUnhandledRejectionNet((reason) => streamDeck.logger.error("unhandled rejection", reason));
 
 loadKeymap();
 

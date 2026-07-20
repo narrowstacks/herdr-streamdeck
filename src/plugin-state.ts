@@ -52,18 +52,59 @@ export async function loadSlots(): Promise<void> {
 	current = new SlotAllocator(state);
 }
 
-/** Persists sticky slot assignments. Call after any claim. */
-export async function saveSlots(): Promise<void> {
-	const settings = await streamDeck.settings.getGlobalSettings<GlobalSettings>();
-	// Spread the persisted SlotAllocatorState into a fresh object literal
-	// (rather than passing `current.toJSON()`'s return value directly) so
-	// `slots` is a structural literal type here too - see the GlobalSettings
-	// comment above for why the named SlotAllocatorState type itself can't
-	// satisfy JsonObject directly.
-	await streamDeck.settings.setGlobalSettings({
-		...settings,
-		slots: { assignments: { ...current.toJSON().assignments } },
+// Finding 2: `saveSlots()` is a read-modify-write against a single global
+// settings blob (getGlobalSettings -> spread -> setGlobalSettings). Two
+// overlapping calls each read the same pre-write snapshot, and whichever
+// `setGlobalSettings` lands last wins - the other call's intended write is
+// silently lost, which is how a slot assignment fails to survive a Stream
+// Deck restart despite `saveSlots()` having been "called". `agent-slot.ts`
+// no longer calls this once per key per render (see claimUnassignedAgents'
+// doc comment), but any caller could still fire it more than once in quick
+// succession (e.g. two "changed" events close together), so the guarantee
+// has to live here, not just in the caller.
+//
+// `saveInFlight` serializes every call through a single chain - no two
+// read-modify-write cycles ever run concurrently - and `saveQueued`
+// coalesces a burst: a call that arrives while a save is already running
+// just flags that one more cycle is needed, rather than enqueuing its own
+// full round trip. The in-flight cycle, on completing, checks that flag and
+// - if set - loops for exactly one more cycle before resolving, reading
+// `current` fresh each time (never memoized), so that extra cycle always
+// picks up whatever state accumulated while it was waiting, including from
+// other saveSlots() calls that arrived in between. A caller's returned
+// promise only resolves once its own write (or a fresher one made after it
+// arrived) has actually landed.
+let saveInFlight: Promise<void> | undefined;
+let saveQueued = false;
+
+/** Persists sticky slot assignments. Call after any claim; see the
+ * serialization/coalescing comment above `saveInFlight` for why calling
+ * this more than once in a row is safe. */
+export function saveSlots(): Promise<void> {
+	if (saveInFlight) {
+		saveQueued = true;
+		return saveInFlight;
+	}
+	saveInFlight = runSaveCycle().finally(() => {
+		saveInFlight = undefined;
 	});
+	return saveInFlight;
+}
+
+async function runSaveCycle(): Promise<void> {
+	do {
+		saveQueued = false;
+		const settings = await streamDeck.settings.getGlobalSettings<GlobalSettings>();
+		// Spread the persisted SlotAllocatorState into a fresh object literal
+		// (rather than passing `current.toJSON()`'s return value directly) so
+		// `slots` is a structural literal type here too - see the GlobalSettings
+		// comment above for why the named SlotAllocatorState type itself can't
+		// satisfy JsonObject directly.
+		await streamDeck.settings.setGlobalSettings({
+			...settings,
+			slots: { assignments: { ...current.toJSON().assignments } },
+		});
+	} while (saveQueued);
 }
 
 let keymap: KeymapTable = DEFAULT_KEYMAP;
