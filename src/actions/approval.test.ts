@@ -19,7 +19,7 @@ describe("decideApproval", () => {
 
 	it("denies a blocked focused agent with its deny keys", () => {
 		const decision = decideApproval({ connected: true, focused: blocked, intent: "deny" });
-		expect(decision).toEqual({ ok: true, paneId: "w1-1", keys: ["Escape"] });
+		expect(decision).toEqual({ ok: true, paneId: "w1-1", keys: ["Esc"] });
 	});
 
 	it("refuses when the focused agent is working, not blocked", () => {

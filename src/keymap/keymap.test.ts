@@ -70,4 +70,9 @@ describe("resolveKeymap", () => {
 			DEFAULT_KEYMAP.default,
 		);
 	});
+
+	it("never ships 'Escape' in DEFAULT_KEYMAP - herdr's pane.send_keys rejects it (accepts 'Esc')", () => {
+		const serialized = JSON.stringify(DEFAULT_KEYMAP);
+		expect(serialized).not.toContain("Escape");
+	});
 });

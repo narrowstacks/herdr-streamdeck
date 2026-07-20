@@ -1,6 +1,6 @@
 {
-	"_comment": "Approve/deny key sequences per agent label as reported by herdr. Unlisted agents fall back to 'default'. Key names must match herdr's pane.send_keys vocabulary.",
-	"claude": { "approve": ["Enter"], "deny": ["Escape"] },
-	"codex": { "approve": ["Enter"], "deny": ["Escape"] },
-	"default": { "approve": ["Enter"], "deny": ["Escape"] }
+	"_comment": "Approve/deny key sequences per agent label as reported by herdr. Unlisted agents fall back to 'default'. Key names must match herdr's pane.send_keys vocabulary (crossterm KeyCode names, case-insensitive; note 'Esc', not 'Escape').",
+	"claude": { "approve": ["Enter"], "deny": ["Esc"] },
+	"codex": { "approve": ["Enter"], "deny": ["Esc"] },
+	"default": { "approve": ["Enter"], "deny": ["Esc"] }
 }
