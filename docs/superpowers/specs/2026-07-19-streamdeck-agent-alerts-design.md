@@ -43,8 +43,9 @@ Verified on this machine on 2026-07-19:
 ## herdr socket protocol
 
 Newline-delimited JSON over a Unix domain socket. Requests carry `id`, `method`, and
-`params`; responses echo `id` and carry `result` or `error`. Unsolicited events arrive
-on the same connection.
+`params`; responses echo `id` and carry `result` or `error`. Events arrive only on a
+connection that has issued `events.subscribe` — see "Connection model" below, which
+corrects an assumption this spec originally got wrong.
 
 Methods this plugin uses:
 
@@ -53,7 +54,7 @@ Methods this plugin uses:
 | `agent.list` | Enumerate agents: `pane_id`, `agent`, `agent_status`, `cwd`, `focused`, `workspace_id` |
 | `agent.focus` | Bring a pane into view |
 | `pane.send_keys` | Send key events to a pane (approve/deny) |
-| `events.subscribe` | Subscribe to a set of events; streams on the same connection |
+| `events.subscribe` | Turn this connection into a one-way event stream |
 
 `agent.list` result shape, observed live:
 
@@ -152,19 +153,21 @@ Four components, each with one purpose and independently testable.
 
 | Component | Purpose | Depends on |
 |---|---|---|
-| `HerdrClient` | Owns the socket. Framing, request/response correlation by `id`, event demux, reconnect with backoff. | socket path |
+| `HerdrClient` | Owns both socket paths: a short-lived connection per request, and one long-lived subscribed event stream with reconnect + re-subscribe. Newline-JSON framing. | socket path |
 | `AgentRegistry` | Source of truth for what agents exist and their state. Emits `agentChanged`. | `HerdrClient` |
 | `SlotAllocator` | Sticky cwd→slot assignment, persisted. Pure logic, no I/O. | nothing |
 | Actions | Stream Deck surface: render state, translate presses into herdr calls. | `AgentRegistry`, `SlotAllocator` |
 
 **Stack:** TypeScript on Elgato's Node SDK (`@elgato/streamdeck`, SDK v2). Node has
-native Unix-socket support, so the plugin holds one persistent connection rather than
-shelling out to the `herdr` binary per tick.
+native Unix-socket support, so the plugin speaks the protocol directly rather than
+shelling out to the `herdr` binary per tick. Note that "persistent connection" applies
+only to the event stream — requests each get their own short-lived connection, because
+herdr closes one after every response.
 
 ### State synchronization — hybrid, deliberately
 
-1. On connect: `agent.list` seeds the registry; subscribe `pane.agent_status_changed`
-   per discovered pane.
+1. On start: `agent.list` (its own connection) seeds the registry; subscribe
+   `pane.agent_status_changed` per discovered pane on the event-stream connection.
 2. Subscribe globally to `pane.created` / `pane.closed` / `pane.agent_detected`. On any
    of these, re-run `agent.list` and reconcile the subscription set.
 3. A 5s `agent.list` reconcile tick as a backstop, to self-heal if an event is dropped
