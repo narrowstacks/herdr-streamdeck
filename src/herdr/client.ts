@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
-import type { HerdrResponse } from "./types.js";
+import type { HerdrResponse, HerdrSubscription } from "./types.js";
 
 export interface HerdrClientOptions {
 	socketPath: string;
@@ -61,6 +61,11 @@ export class HerdrClient extends EventEmitter {
 			this.pending.set(id, { resolve: resolve as (value: never) => void, reject });
 			this.socket!.write(JSON.stringify({ id, method, params }) + "\n");
 		});
+	}
+
+	async subscribe(subscriptions: HerdrSubscription[]): Promise<void> {
+		if (subscriptions.length === 0) return;
+		await this.request("events.subscribe", { subscriptions });
 	}
 
 	close(): void {

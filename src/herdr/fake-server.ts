@@ -53,6 +53,10 @@ export class FakeHerdrServer {
 		for (const socket of this.sockets) socket.write(line);
 	}
 
+	pushRaw(line: string): void {
+		for (const socket of this.sockets) socket.write(line + "\n");
+	}
+
 	dropConnections(): void {
 		for (const socket of this.sockets) socket.destroy();
 		this.sockets.clear();

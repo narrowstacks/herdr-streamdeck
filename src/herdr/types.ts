@@ -21,3 +21,8 @@ export interface HerdrResponse {
 	error?: { code: string; message: string };
 	type?: string;
 }
+
+export interface HerdrSubscription {
+	type: string;
+	pane_id?: string;
+}
