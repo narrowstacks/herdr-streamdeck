@@ -15,6 +15,37 @@ interface RawAgent {
 	workspace_id?: string;
 }
 
+// Finding 4 (round 3): the third shape of the same bug class - `result`
+// itself being something other than an object (null, a number, a string, an
+// array, ...) - blew up on `result.agents` outside any guard, or worse, in
+// some of those shapes (numbers/strings/arrays don't have an `.agents`
+// property either, so the read just silently produces `undefined`) sailed
+// through as if agent.list had returned zero agents. Neither failure mode is
+// acceptable: one crashes the reconcile loop, the other reports `connected
+// === true` off data that was never actually validated.
+//
+// The fix is to stop trusting the RPC's declared return type entirely.
+// `client.request` is called with `<unknown>` (see reconcile()) and this is
+// the ONE place that decides whether an `unknown` response counts as
+// "agent.list actually answered": a plain object with an array `agents`
+// property, full stop. Every response shape that isn't that - including an
+// object with no `agents` property at all, which the pre-round-3 code
+// treated as "zero agents" (success) rather than "malformed" - is rejected
+// here, before a single expression downstream ever reads into it. There is
+// no second code path that also reads `result.agents`; reconcile() only
+// proceeds past this guard once `result` has been narrowed to
+// `AgentListResult`, so no future response shape can reach an unguarded
+// read no matter what herdr sends.
+interface AgentListResult {
+	agents: unknown[];
+}
+
+function isAgentListResult(value: unknown): value is AgentListResult {
+	return (
+		typeof value === "object" && value !== null && Array.isArray((value as { agents?: unknown }).agents)
+	);
+}
+
 const STATUSES: AgentStatus[] = ["idle", "working", "blocked", "unknown"];
 
 function toStatus(raw: string | undefined): AgentStatus {
@@ -177,9 +208,15 @@ export class AgentRegistry extends EventEmitter {
 	protected async reconcile(): Promise<void> {
 		if (this.stopped || !this.client.connected) return;
 
-		let result: { agents?: RawAgent[] };
+		// Finding 4 (round 3): the response type is `unknown`, not a lying
+		// `{ agents?: RawAgent[] }` shape - herdr is an external process and
+		// nothing about the JSON-RPC transport guarantees it sends what the
+		// method name promises. Every read into `result` from here on is
+		// gated by isAgentListResult() below; nothing upstream of that call
+		// is trusted.
+		let result: unknown;
 		try {
-			result = await this.client.request<{ agents?: RawAgent[] }>("agent.list", {});
+			result = await this.client.request<unknown>("agent.list", {});
 		} catch {
 			// Finding 1: a rejected agent.list while the socket stays open
 			// (herdr returned a JSON-RPC {error}) is NOT the same as a
@@ -187,15 +224,11 @@ export class AgentRegistry extends EventEmitter {
 			// emitting "changed" for that case. If the drop DID happen
 			// mid-request instead, client.connected is already false by now
 			// (HerdrClient flips it before rejecting pending requests), so
-			// the branch below is a no-op there and onDisconnected handles
-			// it. Only the "socket fine, RPC failed" case needs this: without
-			// it, `connected` would keep reading true and `agents` would
-			// keep serving pre-failure data forever.
-			if (this.stopped) return;
-			if (this.client.connected && this.lastReconcileOk) {
-				this.lastReconcileOk = false;
-				this.emit("changed");
-			}
+			// failReconcile() below is a no-op there and onDisconnected
+			// handles it. Only the "socket fine, RPC failed" case needs
+			// this: without it, `connected` would keep reading true and
+			// `agents` would keep serving pre-failure data forever.
+			this.failReconcile();
 			return;
 		}
 
@@ -203,26 +236,23 @@ export class AgentRegistry extends EventEmitter {
 		// after stop() must not mutate byPaneId or emit.
 		if (this.stopped) return;
 
-		// Finding 2 (round 2): the per-element hardening in toAgentInfo() below
-		// guards a bad ELEMENT, but a malformed `agents` CONTAINER itself (e.g.
-		// herdr sending `agents: {}` or `agents: 5`) is a different failure
-		// shape entirely - `for...of` on a non-iterable throws synchronously,
-		// which would escape reconcile() (rejecting start()'s promise on the
-		// first call, and on later ticks, skipping the very statement that
-		// sets lastReconcileOk = false). Treat it exactly like a request
-		// failure above: same "was this already known-bad" guard against
-		// redundant emits, same lastReconcileOk flip, no throw.
-		if (result.agents !== undefined && !Array.isArray(result.agents)) {
-			if (this.client.connected && this.lastReconcileOk) {
-				this.lastReconcileOk = false;
-				this.emit("changed");
-			}
+		// Finding 4 (round 3): the single boundary. Every response shape that
+		// isn't a plain object with an array `agents` property - null,
+		// undefined, a number, a string, an array, an object with a
+		// non-array `agents`, or an object with no `agents` at all - is
+		// indistinguishable from a failed request from here on: same
+		// failReconcile() path, same "no throw, no stale-live read" contract.
+		// Nothing below this line executes unless `result` has been narrowed
+		// to `AgentListResult`, so no expression that reads into the
+		// response can sit outside this check.
+		if (!isAgentListResult(result)) {
+			this.failReconcile();
 			return;
 		}
 
 		const next = new Map<string, AgentInfo>();
 		let malformed = 0;
-		for (const raw of result.agents ?? []) {
+		for (const raw of result.agents) {
 			const info = toAgentInfo(raw);
 			if (info) {
 				next.set(info.paneId, info);
@@ -246,6 +276,21 @@ export class AgentRegistry extends EventEmitter {
 			this.emit("changed");
 		} else {
 			this.byPaneId = next;
+		}
+	}
+
+	// Finding 4 (round 3): the one place that flips lastReconcileOk to false
+	// and emits "changed" on that transition, shared by every failure path
+	// in reconcile() (request rejection and a structurally invalid
+	// response). Collapsing what used to be two copies of this same
+	// "was this already known-bad" dance into one method is itself part of
+	// the structural fix - a fourth failure shape now has nowhere to grow a
+	// third copy.
+	private failReconcile(): void {
+		if (this.stopped) return;
+		if (this.client.connected && this.lastReconcileOk) {
+			this.lastReconcileOk = false;
+			this.emit("changed");
 		}
 	}
 

@@ -362,6 +362,80 @@ describe("AgentRegistry", () => {
 		},
 	);
 
+	it.each([
+		["null", null],
+		["undefined (result field omitted)", undefined],
+		["a number", 7],
+		["a string", "oops"],
+		["an array", ["not", "an", "object"]],
+		["an object with no agents property at all", { type: "agent_list" }],
+		["an object with a non-array agents (object)", { agents: {}, type: "agent_list" }],
+		["an object with a non-array agents (number)", { agents: 5, type: "agent_list" }],
+	])(
+		"F4/round3: a structurally invalid agent.list RESULT (%s) does not throw, does not stay connected, and recovers on the next good poll",
+		async (_label, malformedResult) => {
+			const socketPath = await server.start();
+			let mode: "good" | "malformed" = "malformed";
+			server.onRequest((req) => {
+				if (req.method === "agent.list") {
+					if (mode === "malformed") return { id: req.id, result: malformedResult };
+					return { id: req.id, result: agentListResult([CLAUDE]) };
+				}
+				return { id: req.id, result: { type: "subscription_started" } };
+			});
+
+			const unhandledRejections: unknown[] = [];
+			const onUnhandled = (reason: unknown) => unhandledRejections.push(reason);
+			process.on("unhandledRejection", onUnhandled);
+
+			try {
+				client = new HerdrClient({ socketPath });
+				await client.connect();
+				registry = new AgentRegistry(client, { reconcileIntervalMs: 20 });
+
+				// (a)/(b) start() must not reject even though the very first
+				// reconcile - called directly from start(), before any tick
+				// backstop exists - hits this malformed shape, and the poll loop
+				// must still get started (scheduleTick() must still run
+				// afterward, proven below by ticks continuing to land).
+				await expect(registry.start()).resolves.toBeUndefined();
+
+				// (c) must not stay "connected" serving stale/no data as if live.
+				expect(registry.connected).toBe(false);
+				expect(registry.agents).toEqual([]);
+
+				// Let a couple of ticks pass against the same malformed shape to
+				// prove the loop is still alive and connected stays false, not
+				// wedged true (or the loop silently dead) from a throw that
+				// escaped the failure path.
+				await new Promise((resolve) => setTimeout(resolve, 60));
+				expect(registry.connected).toBe(false);
+
+				// (d) a subsequent well-formed poll recovers and fires "changed".
+				mode = "good";
+				const changed = new Promise<void>((resolve) => registry.once("changed", resolve));
+				await changed;
+
+				expect(registry.connected).toBe(true);
+				expect(registry.agents).toEqual([
+					{
+						paneId: "w1-1",
+						agent: "claude",
+						status: "working",
+						cwd: "/work/dorkroom",
+						focused: true,
+						workspaceId: "w1",
+					},
+				]);
+
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				expect(unhandledRejections).toEqual([]);
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+			}
+		},
+	);
+
 	it("F4: calling start() twice does not double-register listeners or orphan a timer chain", async () => {
 		const socketPath = await server.start();
 		server.onRequest((req) => {
