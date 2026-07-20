@@ -19,6 +19,9 @@ export class HerdrClient extends EventEmitter {
 	private pending = new Map<string, Pending>();
 	private nextId = 0;
 	private isConnected = false;
+	private closed = false;
+	private attempt = 0;
+	private reconnectTimer?: NodeJS.Timeout;
 
 	constructor(private readonly options: HerdrClientOptions) {
 		super();
@@ -29,20 +32,37 @@ export class HerdrClient extends EventEmitter {
 	}
 
 	async connect(): Promise<void> {
-		await new Promise<void>((resolve, reject) => {
+		this.closed = false;
+		await this.openOnce();
+	}
+
+	private openOnce(): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			// Defect 2 guard: never allow two live sockets on one client instance.
+			// Detach the prior socket's listeners and destroy it synchronously
+			// (before the new connection even starts) so in-flight data from a
+			// stale connection can never reach onData twice, and reset the
+			// buffer so a fragment from the dead connection can't splice into
+			// the new stream.
+			this.detachSocket();
+
 			const socket = net.createConnection(this.options.socketPath);
 			socket.setEncoding("utf8");
 
 			const onError = (err: Error) => {
 				socket.removeListener("connect", onConnect);
+				this.scheduleReconnect();
 				reject(err);
 			};
 			const onConnect = () => {
 				socket.removeListener("error", onError);
 				this.socket = socket;
 				this.isConnected = true;
+				this.attempt = 0;
+				this.buffer = "";
 				socket.on("data", (chunk: string) => this.onData(chunk));
 				socket.on("error", () => {});
+				socket.on("close", () => this.handleDrop());
 				this.emit("connected");
 				resolve();
 			};
@@ -50,6 +70,45 @@ export class HerdrClient extends EventEmitter {
 			socket.once("error", onError);
 			socket.once("connect", onConnect);
 		});
+	}
+
+	private detachSocket(): void {
+		const socket = this.socket;
+		this.socket = undefined;
+		this.isConnected = false;
+		this.buffer = "";
+		if (socket) {
+			socket.removeAllListeners();
+			socket.destroy();
+		}
+	}
+
+	private handleDrop(): void {
+		if (!this.isConnected) return;
+		this.isConnected = false;
+		this.socket = undefined;
+		this.failPending(new Error("herdr socket disconnected"));
+		this.emit("disconnected");
+		this.scheduleReconnect();
+	}
+
+	private scheduleReconnect(): void {
+		if (this.closed || this.reconnectTimer) return;
+		const base = this.options.reconnectBaseMs ?? 250;
+		const max = this.options.reconnectMaxMs ?? 5000;
+		const delay = Math.min(base * 2 ** this.attempt++, max);
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = undefined;
+			if (this.closed) return;
+			this.openOnce().catch(() => {
+				/* scheduleReconnect already queued by openOnce's error path */
+			});
+		}, delay);
+	}
+
+	private failPending(error: Error): void {
+		for (const { reject } of this.pending.values()) reject(error);
+		this.pending.clear();
 	}
 
 	request<T>(method: string, params: Record<string, unknown>): Promise<T> {
@@ -69,13 +128,16 @@ export class HerdrClient extends EventEmitter {
 	}
 
 	close(): void {
+		this.closed = true;
 		this.isConnected = false;
-		this.socket?.destroy();
-		this.socket = undefined;
-		for (const { reject } of this.pending.values()) {
-			reject(new Error("herdr client closed"));
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = undefined;
 		}
-		this.pending.clear();
+		const socket = this.socket;
+		this.socket = undefined;
+		socket?.destroy();
+		this.failPending(new Error("herdr client closed"));
 	}
 
 	private onData(chunk: string): void {

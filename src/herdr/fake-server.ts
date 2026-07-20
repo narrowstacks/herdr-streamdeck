@@ -48,6 +48,10 @@ export class FakeHerdrServer {
 		this.handler = handler;
 	}
 
+	get socketCount(): number {
+		return this.sockets.size;
+	}
+
 	push(event: unknown): void {
 		const line = JSON.stringify(event) + "\n";
 		for (const socket of this.sockets) socket.write(line);
