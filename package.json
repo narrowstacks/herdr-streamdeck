@@ -4,7 +4,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "rollup -c",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && rollup -c",
     "watch": "rollup -c -w",
     "test": "vitest run",
     "test:watch": "vitest"
