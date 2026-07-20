@@ -12,9 +12,30 @@ vi.mock("@elgato/streamdeck", () => {
 		actions: unknown[] = [];
 	}
 	return {
-		default: { logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn(), trace: vi.fn() } },
+		default: {
+			logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn(), trace: vi.fn() },
+			ui: { sendToPropertyInspector: vi.fn(async () => {}) },
+		},
 		action: () => (target: unknown) => target,
 		SingletonAction: FakeSingletonAction,
+	};
+});
+
+// `raiseTerminalApp` and `detectRunningTerminalApps` are the two functions in
+// terminal.ts that do real I/O (spawn `open`/`ps`) - they have their own
+// dedicated, mocked-at-the-child_process-level tests in terminal.test.ts.
+// Here, only those two are replaced with test-controlled fakes; the pure
+// decision logic (`resolveTerminalAppToRaise`, `isSafeAppName`,
+// `detectRunningTerminals`) stays real, so these tests exercise the actual
+// "should we raise, and what" decision `onKeyDown` makes, not a re-mocked
+// stand-in for it.
+vi.mock("./terminal.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./terminal.js")>();
+	const { vi: vitestVi } = await import("vitest");
+	return {
+		...actual,
+		raiseTerminalApp: vitestVi.fn(async () => {}),
+		detectRunningTerminalApps: vitestVi.fn(async () => [] as string[]),
 	};
 });
 
@@ -54,7 +75,12 @@ vi.mock("../plugin-state.js", async () => {
 	};
 });
 
-const streamDeckMock = await import("@elgato/streamdeck");
+const streamDeckMock = await import("@elgato/streamdeck") as unknown as {
+	default: {
+		logger: Record<"error" | "warn" | "info" | "debug" | "trace", ReturnType<typeof vi.fn>>;
+		ui: { sendToPropertyInspector: ReturnType<typeof vi.fn> };
+	};
+};
 const pluginState = await import("../plugin-state.js") as unknown as {
 	registry: import("node:events").EventEmitter & {
 		connected: boolean;
@@ -65,6 +91,10 @@ const pluginState = await import("../plugin-state.js") as unknown as {
 	saveSlots: ReturnType<typeof vi.fn>;
 	client: { request: ReturnType<typeof vi.fn> };
 	__resetAllocator: () => void;
+};
+const terminalMock = await import("./terminal.js") as unknown as {
+	raiseTerminalApp: ReturnType<typeof vi.fn>;
+	detectRunningTerminalApps: ReturnType<typeof vi.fn>;
 };
 const { AgentSlotAction } = await import("./agent-slot.js");
 
@@ -113,6 +143,11 @@ beforeEach(() => {
 	pluginState.saveSlots.mockClear();
 	pluginState.client.request.mockClear();
 	(streamDeckMock.default.logger.error as ReturnType<typeof vi.fn>).mockClear();
+	streamDeckMock.default.ui.sendToPropertyInspector.mockClear();
+	terminalMock.raiseTerminalApp.mockReset();
+	terminalMock.raiseTerminalApp.mockResolvedValue(undefined);
+	terminalMock.detectRunningTerminalApps.mockReset();
+	terminalMock.detectRunningTerminalApps.mockResolvedValue([]);
 });
 
 describe("AgentSlotAction wiring", () => {
@@ -264,6 +299,156 @@ describe("AgentSlotAction wiring", () => {
 			expect(pluginState.client.request).not.toHaveBeenCalled();
 			expect(key.showAlert).toHaveBeenCalled();
 		});
+
+		describe("raising the configured terminal app", () => {
+			async function pressWithTerminalApp(terminalApp: string | undefined) {
+				const action = new AgentSlotAction();
+				const key = fakeKey("key-1");
+				pluginState.allocator().registerSlot(0);
+				pluginState.allocator().claim("/work/dorkroom");
+				pluginState.registry.agents = [agent({ cwd: "/work/dorkroom", paneId: "pane-7" })];
+				await appear(action, key, 0);
+
+				await action.onKeyDown({
+					action: key,
+					payload: { settings: { slotIndex: 0, terminalApp } },
+				} as never);
+
+				return key;
+			}
+
+			it("raises the configured terminal app after a successful focus", async () => {
+				const key = await pressWithTerminalApp("Ghostty");
+
+				expect(pluginState.client.request).toHaveBeenCalledWith("agent.focus", { target: "pane-7" });
+				expect(terminalMock.raiseTerminalApp).toHaveBeenCalledWith("Ghostty");
+				expect(key.showAlert).not.toHaveBeenCalled();
+			});
+
+			it("trims whitespace around a configured terminal app before raising", async () => {
+				await pressWithTerminalApp("  Ghostty  ");
+
+				expect(terminalMock.raiseTerminalApp).toHaveBeenCalledWith("Ghostty");
+			});
+
+			it("does not raise anything when terminalApp is absent (today's behaviour, unchanged)", async () => {
+				await pressWithTerminalApp(undefined);
+
+				expect(terminalMock.raiseTerminalApp).not.toHaveBeenCalled();
+			});
+
+			it("does not raise anything when terminalApp is blank", async () => {
+				await pressWithTerminalApp("");
+
+				expect(terminalMock.raiseTerminalApp).not.toHaveBeenCalled();
+			});
+
+			it("does not raise anything when terminalApp is whitespace-only", async () => {
+				await pressWithTerminalApp("   ");
+
+				expect(terminalMock.raiseTerminalApp).not.toHaveBeenCalled();
+			});
+
+			it("SAFETY: does not raise a shell-injection-shaped terminalApp value", async () => {
+				await pressWithTerminalApp("foo; rm -rf ~");
+
+				expect(terminalMock.raiseTerminalApp).not.toHaveBeenCalled();
+			});
+
+			it("does not attempt to raise anything when agent.focus itself fails", async () => {
+				const action = new AgentSlotAction();
+				const key = fakeKey("key-1");
+				pluginState.allocator().registerSlot(0);
+				pluginState.allocator().claim("/work/dorkroom");
+				pluginState.registry.agents = [agent({ cwd: "/work/dorkroom", paneId: "pane-7" })];
+				await appear(action, key, 0);
+				pluginState.client.request.mockRejectedValueOnce(new Error("herdr unreachable"));
+
+				await action.onKeyDown({
+					action: key,
+					payload: { settings: { slotIndex: 0, terminalApp: "Ghostty" } },
+				} as never);
+
+				expect(key.showAlert).toHaveBeenCalled();
+				expect(terminalMock.raiseTerminalApp).not.toHaveBeenCalled();
+			});
+
+			it("SAFETY: a raise failure does not throw, does not undo the successful focus, and does not surface as a false showAlert", async () => {
+				terminalMock.raiseTerminalApp.mockRejectedValueOnce(new Error("Unable to find application"));
+
+				const unhandled: unknown[] = [];
+				const onUnhandled = (reason: unknown) => unhandled.push(reason);
+				process.on("unhandledRejection", onUnhandled);
+				try {
+					const key = await pressWithTerminalApp("Ghostty");
+					await flushAsync();
+
+					expect(unhandled).toEqual([]);
+					// Focus already succeeded - a raise failure is a nicety failing,
+					// not the primary action, so it must not trigger showAlert().
+					expect(key.showAlert).not.toHaveBeenCalled();
+					expect(streamDeckMock.default.logger.error).toHaveBeenCalled();
+				} finally {
+					process.off("unhandledRejection", onUnhandled);
+				}
+			});
+		});
+	});
+});
+
+describe("AgentSlotAction property inspector datasource", () => {
+	it("responds to a getTerminals request with the detected terminals as select items", async () => {
+		terminalMock.detectRunningTerminalApps.mockResolvedValueOnce(["Ghostty", "iTerm"]);
+		const action = new AgentSlotAction();
+		const key = fakeKey("key-1");
+
+		await action.onSendToPlugin?.({
+			action: key,
+			payload: { event: "getTerminals" },
+		} as never);
+
+		expect(streamDeckMock.default.ui.sendToPropertyInspector).toHaveBeenCalledWith({
+			event: "getTerminals",
+			items: [
+				{ label: "Ghostty", value: "Ghostty" },
+				{ label: "iTerm", value: "iTerm" },
+			],
+		});
+	});
+
+	it("ignores a sendToPlugin payload for an unrelated event", async () => {
+		const action = new AgentSlotAction();
+		const key = fakeKey("key-1");
+
+		await action.onSendToPlugin?.({
+			action: key,
+			payload: { event: "somethingElse" },
+		} as never);
+
+		expect(streamDeckMock.default.ui.sendToPropertyInspector).not.toHaveBeenCalled();
+		expect(terminalMock.detectRunningTerminalApps).not.toHaveBeenCalled();
+	});
+
+	it("SAFETY: does not throw or produce an unhandled rejection when sendToPropertyInspector itself fails", async () => {
+		streamDeckMock.default.ui.sendToPropertyInspector.mockRejectedValueOnce(new Error("PI gone"));
+		const action = new AgentSlotAction();
+		const key = fakeKey("key-1");
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await action.onSendToPlugin?.({
+				action: key,
+				payload: { event: "getTerminals" },
+			} as never);
+			await flushAsync();
+
+			expect(unhandled).toEqual([]);
+			expect(streamDeckMock.default.logger.error).toHaveBeenCalled();
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
 	});
 });
 

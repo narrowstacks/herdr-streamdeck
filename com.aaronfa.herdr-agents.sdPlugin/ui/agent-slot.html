@@ -17,5 +17,34 @@
 				<option value="7">8</option>
 			</sdpi-select>
 		</sdpi-item>
+
+		<!--
+			Terminal app: pressing this key focuses the agent's pane *within*
+			herdr, but if the terminal app hosting it isn't frontmost, nothing
+			visible happens. Setting this raises that app afterwards. Blank
+			(the default) means "do nothing" - preserves today's behaviour
+			exactly, and is deliberately the default because the plugin cannot
+			reliably detect which terminal app to raise on its own (see
+			terminal.ts's doc comments).
+
+			Two inputs, one setting: the select below is populated at runtime
+			by the plugin (AgentSlotAction.onSendToPlugin in agent-slot.ts)
+			with whichever known terminal apps it detects currently running,
+			via sdpi-select's `datasource` round trip. The text field is the
+			fallback for any app not in that detected list - both are bound to
+			the same "terminalApp" setting, so using either one sets it.
+		-->
+		<sdpi-item label="Terminal app">
+			<sdpi-select
+				setting="terminalApp"
+				datasource="getTerminals"
+				loading="Detecting running terminals…"
+				placeholder="(none — don't raise anything)"
+				show-refresh
+			></sdpi-select>
+		</sdpi-item>
+		<sdpi-item label="Or type a name">
+			<sdpi-textfield setting="terminalApp" placeholder="e.g. Ghostty — leave blank to raise nothing"></sdpi-textfield>
+		</sdpi-item>
 	</body>
 </html>

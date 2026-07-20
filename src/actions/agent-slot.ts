@@ -3,6 +3,7 @@ import streamDeck, {
 	SingletonAction,
 	type DidReceiveSettingsEvent,
 	type KeyAction,
+	type SendToPluginEvent,
 	type WillAppearEvent,
 	type WillDisappearEvent,
 	type KeyDownEvent,
@@ -11,6 +12,7 @@ import type { JsonValue } from "@elgato/utils";
 import { registry, allocator, saveSlots, client } from "../plugin-state.js";
 import { slotImage, slotTitle } from "../slots/render.js";
 import { claimUnassignedAgents, hasBlockedAgent, slotRenderFor } from "./slot-render.js";
+import { detectRunningTerminalApps, raiseTerminalApp, resolveTerminalAppToRaise } from "./terminal.js";
 
 // The explicit index signature (rather than `unknown`) is required for this
 // to satisfy the SDK's `T extends JsonObject` constraint on actions/events -
@@ -19,8 +21,19 @@ import { claimUnassignedAgents, hasBlockedAgent, slotRenderFor } from "./slot-re
 // shape.
 export interface AgentSlotSettings {
 	slotIndex?: number;
+	// Optional macOS app name (e.g. "Ghostty") to raise after a successful
+	// `agent.focus`, so the terminal actually comes to the front instead of
+	// just moving focus within herdr. Blank/absent (the default) means "do
+	// nothing" - see `terminal.ts`'s `resolveTerminalAppToRaise` for why this
+	// has to be user-configured rather than auto-detected.
+	terminalApp?: string;
 	[key: string]: JsonValue | undefined;
 }
+
+/** The `sendToPlugin` event name the property inspector's datasource-driven
+ * terminal picker (see `ui/agent-slot.html`) sends to request the list of
+ * currently-running known terminal apps. */
+const GET_TERMINALS_EVENT = "getTerminals";
 
 const PULSE_MS = 500;
 
@@ -96,6 +109,50 @@ export class AgentSlotAction extends SingletonAction<AgentSlotSettings> {
 			await client.request("agent.focus", { target: agent.paneId });
 		} catch {
 			await ev.action.showAlert();
+			return;
+		}
+
+		// Raising a terminal app is a nicety layered on top of the primary
+		// action above, which has already succeeded by this point. Per the
+		// project's non-negotiable failure-handling rule (see
+		// `logRaiseFailure`'s doc comment), a failure here must not undo or
+		// mask that success: no `showAlert()`, no rethrow, just a log line.
+		const terminalApp = resolveTerminalAppToRaise(ev.payload.settings.terminalApp);
+		if (terminalApp) {
+			try {
+				await raiseTerminalApp(terminalApp);
+			} catch (err) {
+				this.logRaiseFailure(err);
+			}
+		}
+	}
+
+	/**
+	 * Serves the property inspector's `datasource="getTerminals"` picker (see
+	 * `ui/agent-slot.html`). Detects which known terminal apps are currently
+	 * running and sends them back as select items - this is a convenience
+	 * only; the property inspector's free-text field still works for any app
+	 * not in the detected list.
+	 *
+	 * Must never reject: this is wired up by the SDK as a plain event
+	 * listener (see the project's own `route()` wiring in
+	 * `@elgato/streamdeck`), not something any caller awaits, so a rejection
+	 * here would become an unhandled promise rejection - the exact failure
+	 * mode `logRenderFailure`'s doc comment (and `unhandled-rejection.ts`)
+	 * describes as having already taken this plugin down twice before.
+	 */
+	override async onSendToPlugin(ev: SendToPluginEvent<JsonValue, AgentSlotSettings>): Promise<void> {
+		const payload = ev.payload;
+		if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return;
+		if ((payload as { event?: unknown }).event !== GET_TERMINALS_EVENT) return;
+
+		const detected = await detectRunningTerminalApps();
+		const items = detected.map((name) => ({ label: name, value: name }));
+
+		try {
+			await streamDeck.ui.sendToPropertyInspector({ event: GET_TERMINALS_EVENT, items });
+		} catch (err) {
+			this.logSendToPropertyInspectorFailure(err);
 		}
 	}
 
@@ -144,5 +201,21 @@ export class AgentSlotAction extends SingletonAction<AgentSlotSettings> {
 
 	private logSaveFailure(err: unknown): void {
 		streamDeck.logger.error("agent-slot: saveSlots failed", err);
+	}
+
+	/**
+	 * Non-negotiable failure-handling rule for the terminal-raise feature: a
+	 * failure to raise the configured terminal app must never prevent, undo,
+	 * or appear to undo the `agent.focus` that already succeeded before it
+	 * was attempted. Logging and moving on (never `showAlert()`, never
+	 * rethrowing) is what keeps a successful focus from looking like a failed
+	 * key press.
+	 */
+	private logRaiseFailure(err: unknown): void {
+		streamDeck.logger.error("agent-slot: raiseTerminalApp failed", err);
+	}
+
+	private logSendToPropertyInspectorFailure(err: unknown): void {
+		streamDeck.logger.error("agent-slot: sendToPropertyInspector failed", err);
 	}
 }

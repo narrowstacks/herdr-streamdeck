@@ -16,5 +16,5 @@ export default {
 		nodeResolve({ preferBuiltins: true }),
 		commonjs(),
 	],
-	external: ["node:net", "node:os", "node:path", "node:events", "node:fs"],
+	external: ["node:net", "node:os", "node:path", "node:events", "node:fs", "node:child_process"],
 };
