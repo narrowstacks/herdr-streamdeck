@@ -21,5 +21,31 @@
 			"MinimumVersion": "10.15"
 		}
 	],
-	"Actions": []
+	"Actions": [
+		{
+			"UUID": "com.aaronfa.herdr-agents.slot",
+			"Name": "Agent Slot",
+			"Icon": "imgs/actions/slot",
+			"Tooltip": "Shows one herdr agent's state. Press to focus its pane.",
+			"PropertyInspectorPath": "ui/agent-slot.html",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "imgs/actions/slot", "TitleAlignment": "bottom" }]
+		},
+		{
+			"UUID": "com.aaronfa.herdr-agents.approve",
+			"Name": "Approve",
+			"Icon": "imgs/actions/approve",
+			"Tooltip": "Approve the focused agent's pending request. Only acts when it is blocked.",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "imgs/actions/approve" }]
+		},
+		{
+			"UUID": "com.aaronfa.herdr-agents.deny",
+			"Name": "Deny",
+			"Icon": "imgs/actions/deny",
+			"Tooltip": "Deny the focused agent's pending request. Only acts when it is blocked.",
+			"Controllers": ["Keypad"],
+			"States": [{ "Image": "imgs/actions/deny" }]
+		}
+	]
 }

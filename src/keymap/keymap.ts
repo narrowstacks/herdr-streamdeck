@@ -30,6 +30,82 @@ function isKeymapTableShape(value: unknown): value is KeymapTable {
 	return typeof value === "object" && value !== null;
 }
 
+export interface KeymapLoadResult {
+	table: KeymapTable;
+	warnings: string[];
+}
+
+function isNonEmptyStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.length > 0 && value.every((v) => typeof v === "string" && v.length > 0);
+}
+
+function isRawSequenceShape(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Turns an arbitrary parsed JSON value (the loaded keymap.json, or anything a
+ * hand-edit could produce) into a trustworthy KeymapTable, never throwing.
+ *
+ * Closes two gaps a hand-edited config could otherwise hit silently:
+ *  - agent-label keys are lowercased here, matching resolveKeymap()'s
+ *    lowercase lookup — an entry written as "Claude" would otherwise never
+ *    match "claude" and would fall through to `default` with no signal.
+ *  - an entry whose `approve` or `deny` is missing, not an array, or an empty
+ *    array is dropped at load time (with a warning) rather than accepted and
+ *    only failing later, silently, when decideApproval() refuses to send zero
+ *    keystrokes.
+ *
+ * If the input isn't an object at all, or ends up with no usable `default`
+ * entry after invalid entries are dropped, this falls back to DEFAULT_KEYMAP
+ * wholesale — a broken config must not stop the plugin from having *a*
+ * working keymap.
+ */
+export function normalizeKeymapTable(raw: unknown): KeymapLoadResult {
+	const warnings: string[] = [];
+
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		warnings.push("keymap.json is not a JSON object; using the built-in keymap");
+		return { table: DEFAULT_KEYMAP, warnings };
+	}
+
+	const table: KeymapTable = {};
+	for (const [rawKey, rawValue] of Object.entries(raw as Record<string, unknown>)) {
+		if (rawKey === "_comment") continue;
+
+		const key = rawKey.toLowerCase();
+		if (Object.prototype.hasOwnProperty.call(table, key)) {
+			warnings.push(
+				`keymap.json has a duplicate entry for "${key}" (case-insensitive collision on "${rawKey}"); keeping the first, dropping this one`,
+			);
+			continue;
+		}
+
+		if (!isRawSequenceShape(rawValue)) {
+			warnings.push(`keymap.json entry "${rawKey}" is not an object; dropped`);
+			continue;
+		}
+
+		const approve = rawValue.approve;
+		const deny = rawValue.deny;
+		if (!isNonEmptyStringArray(approve) || !isNonEmptyStringArray(deny)) {
+			warnings.push(
+				`keymap.json entry "${rawKey}" has a missing or empty approve/deny key list; dropped (an Approve/Deny key for it would silently do nothing)`,
+			);
+			continue;
+		}
+
+		table[key] = { approve, deny };
+	}
+
+	if (!table.default) {
+		warnings.push("keymap.json has no valid 'default' entry after validation; using the built-in keymap");
+		return { table: DEFAULT_KEYMAP, warnings };
+	}
+
+	return { table, warnings };
+}
+
 export function resolveKeymap(
 	agentLabel: string,
 	table: KeymapTable = DEFAULT_KEYMAP,

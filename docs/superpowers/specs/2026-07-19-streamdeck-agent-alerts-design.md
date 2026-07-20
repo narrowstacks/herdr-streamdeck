@@ -228,23 +228,23 @@ Ships as data, not code, so a new agent CLI is a config line rather than a relea
 
 ```json
 {
-  "claude":  { "approve": ["Enter"], "deny": ["Escape"] },
-  "codex":   { "approve": ["Enter"], "deny": ["Escape"] },
-  "default": { "approve": ["Enter"], "deny": ["Escape"] }
+  "claude":  { "approve": ["Enter"], "deny": ["Esc"] },
+  "codex":   { "approve": ["Enter"], "deny": ["Esc"] },
+  "default": { "approve": ["Enter"], "deny": ["Esc"] }
 }
 ```
 
-**These values are unverified placeholders.** Two things must be pinned down during
-implementation:
-
-1. The key-name vocabulary `pane.send_keys` accepts. This could not be probed from
-   outside — herdr validates `pane_id` before key names, so an invalid-key error is never
-   reached with a synthetic pane. Determine it against a real scratch pane.
-2. The correct approve/deny sequence for each agent CLI, verified against that CLI
-   actually sitting at an approval prompt.
+The key-name vocabulary is **verified** (see "send_keys key vocabulary" above): `Esc`,
+not `Escape`. The **per-agent approve/deny sequences above are still unverified
+placeholders** — nobody has yet sat a real Claude Code or Codex session at an approval
+prompt and confirmed Enter accepts and Esc rejects. This is the one open item left; see
+"Open items for implementation" below.
 
 Any agent whose sequence cannot be verified falls through to `default`, and that is
-documented in the shipped config as a guess rather than a claim.
+documented in the shipped config as a guess rather than a claim. `keymap.json` is loaded
+at startup and normalized (agent-label keys lowercased, entries with an empty or missing
+`approve`/`deny` list dropped) before use, so a hand-edit that doesn't match this shape
+degrades to a logged warning rather than a silently-broken key.
 
 Per-slot keymap overrides are available in the Property Inspector.
 
@@ -274,8 +274,14 @@ Other cases:
   overflow past slot count, persistence round-trip.
 - **`AgentRegistry`** — synthetic event sequences asserting push and reconcile tick
   converge on identical state, including a dropped-event scenario.
-- **Actions** — thin tests over a mocked registry, with the `blocked` gate on Approve/Deny
-  covered explicitly.
+- **Actions** — the `blocked` gate and keymap resolution logic they call
+  (`decideApproval`, `resolveKeymap`) are unit tested directly, as pure functions decoupled
+  from the SDK. The config-loading logic wired into `plugin-state.ts`
+  (`normalizeKeymapTable`, `sanitizeSlotAllocatorState`) is likewise extracted into pure,
+  directly-tested functions. The `SingletonAction` subclasses themselves
+  (`AgentSlotAction`, `ApproveAction`, `DenyAction`) are thin glue over the Stream Deck SDK
+  runtime (action instances, `setImage`/`setTitle`/`showAlert`/`showOk`) and are not
+  practical to unit test in isolation — they are exercised by the end-to-end pass below.
 - **End-to-end** — manual against live herdr. Requires real agent CLIs actually blocking,
   which cannot be faked meaningfully. This is a known gap, not an oversight.
 
@@ -283,9 +289,18 @@ Other cases:
 
 1. ~~Verify `pane.send_keys` key-name vocabulary.~~ **RESOLVED** — see above.
    `Escape` is invalid; use `Esc`.
-2. Verify approve/deny sequences per agent CLI at a live approval prompt.
-   **STILL OPEN** — requires a real agent sitting at a real prompt.
+2. Verify approve/deny sequences per agent CLI at a live approval prompt. **STILL OPEN
+   — the only remaining open item.** Requires a real Claude Code or Codex session sitting
+   at a real approval prompt; `DEFAULT_KEYMAP` and `keymap.json` intentionally still ship
+   the unverified `Enter`/`Esc` guess (documented as such) rather than a fabricated
+   "verified" value. Until this is resolved, treat Approve/Deny as unverified for any
+   agent CLI, and confirm manually before relying on them.
 3. ~~Confirm the payload shape of `pane.agent_status_changed`.~~ **RESOLVED** — see
    above. The originally assumed shape was wrong in every field.
 4. ~~Connection model.~~ **RESOLVED, and it invalidated the original transport
    design** — one request per connection. See "Connection model" above.
+5. ~~Wire the actions, manifest, property inspector, and icons; build and install the
+   plugin.~~ **RESOLVED.** All three actions (`AgentSlot`, `Approve`, `Deny`) are
+   implemented and registered, `npm test` and `npm run build` pass, and the plugin is
+   installed via symlink. Manual end-to-end verification against live herdr (including
+   item 2 above) is still required before this ships.
