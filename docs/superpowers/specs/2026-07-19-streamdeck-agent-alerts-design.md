@@ -66,25 +66,85 @@ Methods this plugin uses:
 }],"type":"agent_list"}}
 ```
 
+### Connection model — VERIFIED, and it is not what this spec originally assumed
+
+**herdr's API socket serves exactly ONE request per connection, then closes it.**
+Verified 2026-07-20 against the running server by direct probing:
+
+```
+ping, ping        ->  resp | CLOSED | (closed before 2nd)
+ping, agent.list  ->  resp | CLOSED | (closed before 2nd)
+agent.list, ping  ->  resp | CLOSED | (closed before 2nd)
+subscribe-only    ->  still open after 5s
+```
+
+`events.subscribe` is the sole exception: that connection stays open indefinitely
+as a one-way event stream. Sending any request on a subscribed connection causes
+herdr to close it.
+
+This spec originally specified a single persistent multiplexed connection with
+request/response correlation by `id` and a reconnect supervisor. **That design is
+impossible against this server** and was corrected after the transport was built.
+
+The required shape is two distinct paths:
+
+| Path | Lifetime | Used for |
+|---|---|---|
+| Request | One connection per request: connect, send, read one response, peer closes | `agent.list`, `agent.focus`, `pane.send_keys` |
+| Event | One long-lived connection, subscribe then listen | `pane.agent_status_changed` and lifecycle events |
+
+Because only one request is ever in flight per connection, request/response
+correlation by `id` is unnecessary on the request path (harmless to keep for
+sanity-checking the reply).
+
+The event connection still needs reconnect with backoff, and must **re-subscribe**
+after every reconnect — subscriptions do not survive a new connection.
+
 ### Subscription constraint
 
-`events.subscribe` takes `params.subscriptions`, an array of internally-tagged objects.
-Available variants include `pane.created`, `pane.closed`, `pane.focused`, `pane.exited`,
-`pane.agent_detected`, `pane.agent_status_changed`, plus workspace and tab lifecycle
-events.
-
-**`pane.agent_status_changed` requires a `pane_id`.** Subscriptions are per-pane, not
-global. Verified:
+`events.subscribe` takes `params.subscriptions`, an array of internally-tagged
+objects. `pane.agent_status_changed` requires a `pane_id`; `pane.created`,
+`pane.closed`, and `pane.agent_detected` do not. Verified:
 
 ```json
 {"id":"s1","method":"events.subscribe","params":{"subscriptions":[
   {"type":"pane.agent_status_changed","pane_id":"w65704613465d81-1"},
   {"type":"pane.created"}]}}
-→ {"id":"s1","result":{"type":"subscription_started"}}
+-> {"id":"s1","result":{"type":"subscription_started"}}
 ```
 
-This is the single most consequential protocol fact for the design: you cannot subscribe
-to an agent that does not exist yet, so push alone cannot be the whole sync strategy.
+You cannot subscribe to an agent that does not exist yet, so push alone cannot be
+the whole sync strategy — hence the poll backstop.
+
+### Event payload shape — VERIFIED, also not as originally assumed
+
+This spec originally assumed `{type, pane_id, agent_status}` at the top level.
+Real payloads, captured verbatim from the wire:
+
+```json
+{"data":{"agent":"claude","agent_status":"blocked","pane_id":"w65704613465d81-2","workspace_id":"w65704613465d81"},"event":"pane.agent_status_changed"}
+{"data":{"pane_id":"w65704613465d81-2","type":"pane_closed","workspace_id":"w65704613465d81"},"event":"pane_closed"}
+{"data":{"agent":"claude","pane_id":"w65704613465d81-1","type":"pane_agent_detected","workspace_id":"w65704613465d81"},"event":"pane_agent_detected"}
+```
+
+- The discriminator is **`event`**, not `type`. Fields live under **`data`**.
+- Naming is inconsistent: `pane.agent_status_changed` arrives DOTTED, but the
+  lifecycle events arrive UNDERSCORED (`pane_created`, `pane_closed`,
+  `pane_agent_detected`). A handler must accept both spellings.
+- `pane_created` nests its pane fields one level deeper, under `data.pane`.
+
+Full captured fixtures: `.superpowers/sdd/real-herdr-events.md`.
+
+### send_keys key vocabulary — VERIFIED
+
+```
+ACCEPTED: Enter, enter, Esc, esc, Tab, tab, Down, down, ctrl+c, y, 1
+REJECTED: Escape, escape, ctrl-c
+```
+
+**`Escape` is rejected; the accepted name is `Esc`.** Names are case-insensitive,
+modifiers use `+` not `-`, and single characters are valid keys. The vocabulary is
+crossterm `KeyCode` names.
 
 ## Architecture
 
@@ -218,8 +278,11 @@ Other cases:
 
 ## Open items for implementation
 
-1. Verify `pane.send_keys` key-name vocabulary against a real pane.
+1. ~~Verify `pane.send_keys` key-name vocabulary.~~ **RESOLVED** — see above.
+   `Escape` is invalid; use `Esc`.
 2. Verify approve/deny sequences per agent CLI at a live approval prompt.
-3. Confirm the payload shape of `pane.agent_status_changed` events — the subscription
-   handshake was verified, but no status transition was observed during design, so the
-   event body is not yet known.
+   **STILL OPEN** — requires a real agent sitting at a real prompt.
+3. ~~Confirm the payload shape of `pane.agent_status_changed`.~~ **RESOLVED** — see
+   above. The originally assumed shape was wrong in every field.
+4. ~~Connection model.~~ **RESOLVED, and it invalidated the original transport
+   design** — one request per connection. See "Connection model" above.
