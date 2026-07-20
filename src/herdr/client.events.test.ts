@@ -18,6 +18,7 @@ describe("HerdrClient event stream", () => {
 
 	it("sends subscriptions in the params shape herdr requires", async () => {
 		const socketPath = await server.start();
+		server.addPane("w1-1");
 		const seen: HerdrRequest[] = [];
 		server.onRequest((req) => {
 			seen.push(req);
@@ -64,6 +65,7 @@ describe("HerdrClient event stream", () => {
 
 	it("emits unsolicited messages as events rather than resolving requests", async () => {
 		const socketPath = await server.start();
+		server.addPane("w1-1");
 		server.onRequest((req) => ({ id: req.id, result: { type: "subscription_started" } }));
 
 		client = new HerdrClient({ socketPath });
@@ -110,6 +112,7 @@ describe("HerdrClient event stream", () => {
 	// herdr push is available.
 	it("adding a subscription to an already-subscribed connection transparently reopens it with the full merged set", async () => {
 		const socketPath = await server.start();
+		server.addPane("w1-1");
 		const seen: HerdrRequest[] = [];
 		server.onRequest((req) => {
 			seen.push(req);
@@ -150,6 +153,7 @@ describe("HerdrClient event stream", () => {
 
 	it("adding subscriptions still delivers events pushed to the new connection", async () => {
 		const socketPath = await server.start();
+		server.addPane("w1-1");
 		server.onRequest((req) => ({ id: req.id, result: { type: "subscription_started" } }));
 
 		client = new HerdrClient({ socketPath });

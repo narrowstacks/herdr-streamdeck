@@ -55,12 +55,23 @@ function toStatus(raw: string | undefined): AgentStatus {
 // herdr's global pane-lifecycle subscriptions - no `pane_id`, confirmed
 // against a live herdr server not to require one (unlike
 // pane.agent_status_changed below, which does). Subscribed once, globally,
-// in start() and again on every reconnect, since herdr has no unsubscribe
-// and subscriptions do not survive a new connection.
+// via HerdrClient's accumulate-only "sticky" pool (client.subscribe()) - see
+// client.ts's class comment for why this pool never needs pruning the way
+// per-pane subscriptions do. Sent once in start() and (automatically, by
+// the client itself) resent on every reconnect, since herdr has no
+// unsubscribe and subscriptions do not survive a new connection.
+//
+// Finding 5: `pane.focused` lives here too. herdr's subscription vocabulary
+// includes it (confirmed live), it takes no `pane_id` just like the other
+// three, and it is what keeps `focused` (see applyFocus() below) from
+// lagging up to a full reconcileIntervalMs behind the user actually
+// switching panes - the exact window in which Approve/Deny could otherwise
+// act on the wrong agent when two are simultaneously blocked.
 const LIFECYCLE_SUBSCRIPTIONS = [
 	{ type: "pane.created" },
 	{ type: "pane.closed" },
 	{ type: "pane.agent_detected" },
+	{ type: "pane.focused" },
 ];
 
 // Verified against a live herdr server (0.6.9, protocol 13; see
@@ -90,6 +101,18 @@ const LIFECYCLE_EVENT_NAMES = new Set([
 
 const STATUS_CHANGED_EVENT_NAMES = new Set(["pane.agent_status_changed", "pane_agent_status_changed"]);
 
+// Finding 5: verified live by subscribing to `pane.focused` on a real herdr
+// server and driving focus changes on two throwaway panes. Captured
+// verbatim: {"data":{"pane_id":"w657086528ced52-2","type":"pane_focused",
+// "workspace_id":"w657086528ced52"},"event":"pane_focused"} - i.e. it
+// follows the SAME convention as the other lifecycle events (subscribed
+// dotted, delivered underscored, `data.type` present), not the
+// pane.agent_status_changed convention (delivered dotted, no `data.type`).
+// Both spellings are still accepted here, same rationale as
+// LIFECYCLE_EVENT_NAMES: nothing rules out a future herdr settling on the
+// dotted form for this event too.
+const FOCUSED_EVENT_NAMES = new Set(["pane.focused", "pane_focused"]);
+
 // The second untrusted input path (the first being agent.list's response,
 // guarded by isAgentListResult above). A pushed event is whatever herdr
 // wrote to the socket, parsed as JSON with zero shape guarantee - it can be
@@ -102,7 +125,8 @@ const STATUS_CHANGED_EVENT_NAMES = new Set(["pane.agent_status_changed", "pane_a
 // payload directly.
 type ParsedHerdrEvent =
 	| { kind: "lifecycle" }
-	| { kind: "status"; paneId: string; status: AgentStatus };
+	| { kind: "status"; paneId: string; status: AgentStatus }
+	| { kind: "focused"; paneId: string };
 
 function parseHerdrEvent(value: unknown): ParsedHerdrEvent | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
@@ -122,6 +146,12 @@ function parseHerdrEvent(value: unknown): ParsedHerdrEvent | undefined {
 			paneId,
 			status: toStatus(typeof agentStatus === "string" ? agentStatus : undefined),
 		};
+	}
+
+	if (FOCUSED_EVENT_NAMES.has(eventName)) {
+		const paneId = (data as { pane_id?: unknown }).pane_id;
+		if (typeof paneId !== "string" || paneId.length === 0) return undefined;
+		return { kind: "focused", paneId };
 	}
 
 	return undefined;
@@ -170,13 +200,6 @@ export class AgentRegistry extends EventEmitter {
 	// or listen for "agent:malformed" (emitted with the count dropped on
 	// that reconcile) to notice herdr is sending bad data.
 	private droppedMalformedCount = 0;
-	// Tracks pane ids we've already sent a `pane.agent_status_changed`
-	// subscription for. herdr exposes no unsubscribe, so subscriptions for
-	// panes that later close are simply left to lapse - this set exists only
-	// to prevent re-sending a duplicate subscribe for a pane already covered.
-	// Cleared on disconnect (see onDisconnected): subscriptions do not
-	// survive a new connection, so the bookkeeping for the old one is void.
-	private subscribedPanes = new Set<string>();
 	// Finding 1 (round 4) / Finding 2 (round 4): reconcile() has no fewer than
 	// four unsynchronized call sites - tick()'s timer, onConnected, and now a
 	// fire-and-forget call for every pushed lifecycle event - and nothing
@@ -193,13 +216,13 @@ export class AgentRegistry extends EventEmitter {
 	// order). `appliedSeq` is the sequence number of the last attempt whose
 	// outcome - success OR failure - actually got applied to state.
 	// Immediately after every await inside reconcile() (the agent.list round
-	// trip, and again after subscribeNewPanes()'s own round trip), an attempt
-	// checks whether a strictly newer attempt has already applied since it
-	// started; if so, it discards itself completely - no byPaneId mutation,
-	// no subscribeNewPanes() call (or, if already past that check, no emit) -
-	// rather than clobber data that is, by definition, more current than its
-	// own. Whichever attempt was started MOST RECENTLY always wins, never
-	// whichever happens to answer first.
+	// trip, and again after syncPaneSubscriptions()'s own round trip), an
+	// attempt checks whether a strictly newer attempt has already applied
+	// since it started; if so, it discards itself completely - no byPaneId
+	// mutation, no syncPaneSubscriptions() call (or, if already past that
+	// check, no emit) - rather than clobber data that is, by definition,
+	// more current than its own. Whichever attempt was started MOST
+	// RECENTLY always wins, never whichever happens to answer first.
 	private reconcileSeq = 0;
 	private appliedSeq = 0;
 
@@ -295,10 +318,12 @@ export class AgentRegistry extends EventEmitter {
 		this.lastReconcileOk = false;
 		// Subscriptions do not survive a new connection - herdr has no
 		// unsubscribe, so the old socket's subscriptions simply die with it.
-		// Clearing this means the next reconcile()'s subscribeNewPanes() will
-		// re-subscribe every still-live pane on the new connection instead of
-		// believing (wrongly) that they're already covered.
-		this.subscribedPanes.clear();
+		// Nothing needs clearing here on this class's side, though: the
+		// client's own "managed" subscription pool (see client.ts) already
+		// persists across reconnects and is resent automatically, and the
+		// next reconcile()'s syncPaneSubscriptions() call always passes the
+		// CURRENT live pane set regardless of what happened before - there is
+		// no local "already subscribed" bookkeeping left here to go stale.
 		this.emit("changed");
 	};
 
@@ -345,12 +370,46 @@ export class AgentRegistry extends EventEmitter {
 			return;
 		}
 
+		if (event.kind === "focused") {
+			this.applyFocus(event.paneId);
+			return;
+		}
+
 		const existing = this.byPaneId.get(event.paneId);
 		if (!existing) return;
 		if (existing.status === event.status) return;
 		this.byPaneId.set(event.paneId, { ...existing, status: event.status });
 		this.emit("changed");
 	};
+
+	// Finding 5: `pane.focused` only ever tells us which pane GAINED focus,
+	// never which one lost it (see the captured payload on
+	// FOCUSED_EVENT_NAMES above: just `{pane_id, type, workspace_id}`, no
+	// boolean and no list of losers). Focus is exclusive - exactly one pane
+	// at a time - so gaining it here implies every other currently-tracked
+	// pane lost it, and this applies both.
+	//
+	// If `paneId` isn't (yet) in `byPaneId` - the focus push can outrace the
+	// reconcile that will eventually learn the pane exists - every existing
+	// entry still gets un-focused and nothing gets newly focused, so
+	// `registry.focused` reads `undefined` for that window rather than
+	// keeping the WRONG pane marked focused. That is the governing invariant
+	// (never present stale state as live: prefer visibly-unknown over
+	// confidently-wrong) applied to this one field.
+	private applyFocus(paneId: string): void {
+		let changed = false;
+		const next = new Map(this.byPaneId);
+		for (const [id, info] of next) {
+			const shouldBeFocused = id === paneId;
+			if (info.focused !== shouldBeFocused) {
+				next.set(id, { ...info, focused: shouldBeFocused });
+				changed = true;
+			}
+		}
+		if (!changed) return;
+		this.byPaneId = next;
+		this.emit("changed");
+	}
 
 	private scheduleTick(): void {
 		if (this.stopped) return;
@@ -447,8 +506,8 @@ export class AgentRegistry extends EventEmitter {
 		// this is the reviewer's exact repro (a stale `working` snapshot
 		// released after a fresher `blocked` one already landed). Discard
 		// whole: no byPaneId mutation, no malformed-count bump, no
-		// subscribeNewPanes() call, no emit. The reconcile that actually is
-		// newest already (or will) speak for the registry's current state.
+		// syncPaneSubscriptions() call, no emit. The reconcile that actually
+		// is newest already (or will) speak for the registry's current state.
 		if (this.isSuperseded(seq)) return;
 
 		// Finding 4 (round 3): the single boundary. Every response shape that
@@ -492,15 +551,21 @@ export class AgentRegistry extends EventEmitter {
 		this.byPaneId = next;
 		this.appliedSeq = seq;
 
-		// Subscribe to any pane discovered by this reconcile that we haven't
-		// already subscribed to. This is what makes push actually apply to
-		// newly-appeared panes rather than just ones seen since start(): the
-		// per-pane pane.agent_status_changed subscription requires a pane_id
-		// (verified against a live herdr server), so it can only be sent once
-		// a pane is known, i.e. from here - never up front in start().
-		await this.subscribeNewPanes();
+		// Sync the client's per-pane subscription set to exactly what this
+		// reconcile just learned is live. This is what makes push actually
+		// apply to newly-appeared panes rather than just ones seen since
+		// start() (the per-pane pane.agent_status_changed subscription
+		// requires a pane_id - verified against a live herdr server - so it
+		// can only be sent once a pane is known, i.e. from here, never up
+		// front in start()) AND - Critical finding - what makes a CLOSED
+		// pane's subscription actually stop being sent: replaceSubscriptions()
+		// (see client.ts) replaces the managed set wholesale with `next`'s
+		// keys, so a pane missing from this reconcile's live snapshot is
+		// simply absent from the very next resync, with no accumulated
+		// history left over to resubscribe (and get rejected on) forever.
+		await this.syncPaneSubscriptions();
 
-		// Finding 5, extended: subscribeNewPanes() awaits a network round
+		// Finding 5, extended: syncPaneSubscriptions() awaits a network round
 		// trip. If stop() ran during that await, this reconcile must not
 		// emit after it - byPaneId is already a private, internally
 		// consistent snapshot at this point (assigned synchronously above),
@@ -509,7 +574,7 @@ export class AgentRegistry extends EventEmitter {
 		if (this.stopped) return;
 
 		// Finding 1/2 (round 4): even newer still - a reconcile started after
-		// this one both ran AND applied while subscribeNewPanes()'s own
+		// this one both ran AND applied while syncPaneSubscriptions()'s own
 		// network round trip was in flight. This one's `shouldEmit` was
 		// computed against a byPaneId snapshot that's no longer current (the
 		// newer attempt already overwrote it and already emitted its own
@@ -530,22 +595,39 @@ export class AgentRegistry extends EventEmitter {
 		return seq <= this.appliedSeq;
 	}
 
-	// herdr has no unsubscribe (see the class-level `subscribedPanes` comment
-	// for the full rationale), so this only ever adds subscriptions for
-	// panes not already tracked. Subscribing is best-effort: if the request
-	// fails, the newly-added ids are rolled back out of `subscribedPanes` so
-	// the next reconcile retries them, rather than the pane silently going
-	// un-pushed forever while still believed subscribed.
-	private async subscribeNewPanes(): Promise<void> {
-		const fresh = [...this.byPaneId.keys()].filter((paneId) => !this.subscribedPanes.has(paneId));
-		if (fresh.length === 0) return;
-		for (const paneId of fresh) this.subscribedPanes.add(paneId);
+	// Critical finding fix: drives the client's per-pane subscription set
+	// from the LIVE pane set this reconcile just observed, not an
+	// ever-growing history. Previously this method (subscribeNewPanes())
+	// tracked "already subscribed" locally and only ever ADDED to it -
+	// herdr has no unsubscribe, so a pane that closed stayed in that set
+	// forever, and since HerdrClient resent its own full desired set on
+	// every reconnect, one closed pane's now-invalid subscription got
+	// resent - and rejected, killing the connection - on every single
+	// future reconnect, permanently. See client.ts's class comment for the
+	// full failure mode and the two-pool fix.
+	//
+	// The fix here is simply to stop tracking "already subscribed"
+	// ourselves at all: replaceSubscriptions() already no-ops when the set
+	// it's given is unchanged from last time (see client.ts's setManaged()),
+	// so calling it with the CURRENT live pane set on every reconcile - not
+	// just newly-discovered panes - is both correct (a closed pane is
+	// simply absent from `next.keys()`, so it drops out of the managed set
+	// automatically) and just as cheap as the old add-only approach in the
+	// common case where nothing changed.
+	//
+	// Best-effort like the method it replaces: a failure here (e.g. the
+	// event connection itself being down) must not fail reconcile() as a
+	// whole - poll remains the backstop regardless of whether push ever
+	// works - and there is nothing to roll back on failure, since this
+	// class no longer keeps its own copy of "what's subscribed" for a
+	// failure to have corrupted.
+	private async syncPaneSubscriptions(): Promise<void> {
 		try {
-			await this.client.subscribe(
-				fresh.map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId })),
+			await this.client.replaceSubscriptions(
+				[...this.byPaneId.keys()].map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId })),
 			);
 		} catch {
-			for (const paneId of fresh) this.subscribedPanes.delete(paneId);
+			/* push is an accelerant, not a dependency; poll still covers us. */
 		}
 	}
 

@@ -25,6 +25,12 @@ function subscriptionKey(sub: HerdrSubscription): string {
 	return `${sub.type}:${sub.pane_id ?? ""}`;
 }
 
+function setsEqual(a: Set<string>, b: Set<string>): boolean {
+	if (a.size !== b.size) return false;
+	for (const item of a) if (!b.has(item)) return false;
+	return true;
+}
+
 // ---------------------------------------------------------------------------
 // Architecture (see docs/superpowers/specs/2026-07-19-streamdeck-agent-alerts-design.md,
 // "Connection model" and "Subscription constraint" - both verified against a
@@ -44,17 +50,76 @@ function subscriptionKey(sub: HerdrSubscription): string {
 //  - request(): one brand-new short-lived connection per call. Connect,
 //    write one line, read one line, tear down. No multiplexing is possible
 //    (or needed - herdr only ever has one request in flight per connection).
-//  - The event path (connect()/subscribe()): one long-lived connection that
-//    sends `events.subscribe` and then only listens. Adding a subscription
-//    later (e.g. a newly-discovered pane) cannot be layered onto a live
-//    subscribed connection - the verified behavior above means it must
-//    close the old connection and open a fresh one, subscribing to the
-//    FULL desired set every time. `desiredSubscriptions` is the client's
-//    memory of that full set, and is what makes "re-subscribe after every
-//    reconnect" (both a manual resubscribe and an unplanned drop) work: any
-//    time the event connection is (re)established, if the desired set is
-//    non-empty it is sent immediately, before the connection is considered
-//    usable.
+//  - The event path (connect()/subscribe()/replaceSubscriptions()): one
+//    long-lived connection that sends `events.subscribe` and then only
+//    listens. Adding a subscription later (e.g. a newly-discovered pane)
+//    cannot be layered onto a live subscribed connection - the verified
+//    behavior above means it must close the old connection and open a
+//    fresh one, subscribing to the FULL desired set every time.
+//
+// Two accumulation policies, one wire set (Critical finding fix)
+// -----------------------------------------------------------------
+// herdr also rejects an `events.subscribe` naming a `pane.agent_status_changed`
+// pane_id that doesn't exist (or no longer exists), and closes the
+// connection when it does - verified live: `{"error":{"code":"internal_error",
+// "message":"failed to decode pane get error"}}` followed by an immediate
+// close. Combined with "resend the FULL desired set on every reconnect",
+// a desired set that only ever GROWS (the original design: every pane ever
+// seen, accumulated forever) means one closed pane permanently wedges the
+// event stream: every reconnect resends it, herdr rejects it, the socket
+// dies, forever - even though every other subscription in the set is fine.
+//
+// The desired set is therefore split into two independently-managed pools,
+// merged (see combinedDesired()) only at the moment a connection is
+// (re)established:
+//
+//  - "sticky" pool (subscribe()): accumulate-only, exactly the original
+//    behavior. Used for the four pane-id-less lifecycle subscriptions
+//    (pane.created/closed/agent_detected/focused) - a fixed, small set that
+//    never needs pruning and herdr never rejects (they don't name a pane).
+//  - "managed" pool (replaceSubscriptions()): wholesale-REPLACED on every
+//    call with exactly what's passed in, not merged into history. This is
+//    what per-pane pane.agent_status_changed subscriptions use: the caller
+//    (AgentRegistry) already knows the current LIVE pane set from its most
+//    recent agent.list, and passing that set every time means a closed
+//    pane's subscription is simply never re-sent again after the next
+//    resync - no accumulated history to prune, because none is kept.
+//
+// Belt-and-suspenders: even the live pane set can race herdr (a pane can
+// close between AgentRegistry's agent.list snapshot and the subscribe frame
+// actually landing). So a rejection is also handled reactively: dispatch()
+// recognizes a subscribe-error frame (see below), identifies exactly which
+// subscription it named via the snapshot sent alongside it, and removes
+// that one subscription from whichever pool holds it (dropSubscription())
+// before the automatic reconnect resends the (now-shrunk) set. A stale id
+// can therefore cost at most a handful of backoff-delayed reconnects to
+// self-heal, never a permanent wedge, even if nothing external ever calls
+// replaceSubscriptions() again.
+//
+// Subscribe-error id derivation (Finding 4) - VERIFIED against the live
+// server, not invented:
+//
+//   request: {"id":"sub1","method":"events.subscribe","params":{"subscriptions":[
+//     {"type":"pane.agent_status_changed","pane_id":"dead-pane"}]}}
+//   response: {"id":"sub1:sub:0:probe","error":{"code":"internal_error",
+//     "message":"failed to decode pane get error"}}
+//
+// A SUCCESSFUL subscribe echoes the request id verbatim (unchanged from the
+// original design). A REJECTED one instead answers with a DERIVED id:
+// `${requestId}:sub:${index}:probe` where `index` is the zero-based
+// position of the offending subscription within the `subscriptions` array
+// that was sent - confirmed by sending a 3-entry batch with the bad entry
+// at index 1 and observing `sub2:sub:1:probe` come back. herdr also stops
+// at the FIRST invalid entry and closes immediately: a batch with two dead
+// panes only ever reports the first one, never both in a single frame -
+// which is exactly why the reactive drop-and-reconnect loop above can only
+// ever prune one bad id per cycle, and why a proactively-accurate desired
+// set (the "managed" pool above) matters far more than reacting after the
+// fact. The literal trailing `:probe` looks like an internal herdr debug
+// tag rather than anything derived from our request content - matching is
+// therefore done on the `${requestId}:sub:` PREFIX plus a parsed integer,
+// not on the literal suffix, so a future herdr build using a different tag
+// there doesn't silently stop being recognized.
 // ---------------------------------------------------------------------------
 export class HerdrClient extends EventEmitter {
 	// --- event-path state ---
@@ -66,20 +131,36 @@ export class HerdrClient extends EventEmitter {
 	private reconnectTimer?: NodeJS.Timeout;
 	private nextId = 0;
 
-	// The full set of subscriptions the caller wants active, accumulated
-	// across every subscribe() call for this client's lifetime (herdr has no
-	// unsubscribe). Resent in full every time the event connection is
-	// (re)established - see the class comment above.
-	private desiredSubscriptions: HerdrSubscription[] = [];
-	private desiredKeys = new Set<string>();
+	// Accumulate-only pool - see the class comment's "Two accumulation
+	// policies" section. Populated by subscribe(); never pruned except by a
+	// live subscribe-rejection (dropSubscription()), which in practice never
+	// applies to this pool since its members never name a pane.
+	private stickySubscriptions: HerdrSubscription[] = [];
+	private stickyKeys = new Set<string>();
+
+	// Replace-wholesale pool - see the class comment. Populated (and fully
+	// superseded on every call, not merged) by replaceSubscriptions(). This
+	// is what makes "drive subscriptions from the live pane set" possible:
+	// a pane missing from the caller's most recent call is simply absent
+	// from this pool on the very next resync, with no accumulated history
+	// to actively prune.
+	private managedSubscriptions: HerdrSubscription[] = [];
+	private managedKeys = new Set<string>();
 
 	// The single events.subscribe request that can be outstanding on the
-	// event connection at a time (never more than one - subscribe() calls
-	// are serialized through `opChain` below). Unlike the request path,
-	// there is exactly one request "shape" this connection ever sends, so a
-	// single waiter slot (not a Map keyed by id) is all correlation needs.
+	// event connection at a time (never more than one - subscribe() and
+	// replaceSubscriptions() calls are serialized through `opChain` below).
+	// Unlike the request path, there is exactly one request "shape" this
+	// connection ever sends, so a single waiter slot (not a Map keyed by
+	// id) is all correlation needs.
 	private subscribeAckWaiter?: { resolve: () => void; reject: (err: Error) => void };
 	private pendingSubscribeId?: string;
+	// The exact array sent alongside pendingSubscribeId, kept so a rejection
+	// frame's derived id (see class comment) can be resolved back to the
+	// concrete HerdrSubscription that failed - dispatch() has only an index
+	// to go on, and this is the only place that array still exists once the
+	// request has been written to the wire.
+	private pendingSubscribeSnapshot?: HerdrSubscription[];
 
 	// The socket for a connect attempt currently mid-handshake, tracked
 	// separately from `socket` (which is only assigned once "connect"
@@ -91,26 +172,28 @@ export class HerdrClient extends EventEmitter {
 	private connectingResolve?: () => void;
 
 	// Serializes every operation that touches the event connection (manual
-	// connect(), subscribe(), and the automatic post-drop reconnect) so none
-	// of them can interleave and race each other's view of `socket` /
-	// `desiredSubscriptions` / `isConnected`. Each queued task's own
-	// success/failure is still observable to its caller via the promise
-	// enqueue() returns; only the *chain* itself is swallowed (via the
-	// no-throw `.then(ok, ok)` below) so one task's rejection can never
-	// leak out as an unhandled rejection on a later, unrelated caller's
-	// queued task.
+	// connect(), subscribe(), replaceSubscriptions(), and the automatic
+	// post-drop reconnect) so none of them can interleave and race each
+	// other's view of `socket` / the subscription pools / `isConnected`.
+	// Each queued task's own success/failure is still observable to its
+	// caller via the promise enqueue() returns; only the *chain* itself is
+	// swallowed (via the no-throw `.then(ok, ok)` below) so one task's
+	// rejection can never leak out as an unhandled rejection on a later,
+	// unrelated caller's queued task.
 	private opChain: Promise<void> = Promise.resolve();
 
 	constructor(private readonly options: HerdrClientOptions) {
 		super();
 	}
 
-	/** True only when the long-lived event-stream connection is up. This is
-	 * deliberately NOT about whether requests can succeed - the request path
-	 * (request()) is fully independent, one connection per call, and works
-	 * regardless of this flag. This flag exists so a consumer (AgentRegistry)
-	 * can know whether push delivery is currently live, since that's what its
-	 * own freshness guarantee depends on. */
+	/** True only once the long-lived event connection has been established
+	 * AND, if there was anything to subscribe to, herdr has actually
+	 * acknowledged the subscribe (Finding 3) - never merely "the TCP socket
+	 * is open". This is deliberately NOT about whether requests can succeed
+	 * - the request path (request()) is fully independent, one connection
+	 * per call, and works regardless of this flag. This flag exists so a
+	 * consumer (AgentRegistry) can know whether push delivery is currently
+	 * live, since that's what its own freshness guarantee depends on. */
 	get connected(): boolean {
 		return this.isConnected;
 	}
@@ -128,24 +211,46 @@ export class HerdrClient extends EventEmitter {
 	 * connected. Does not by itself subscribe to anything - if the desired
 	 * set is empty this just opens a bare connection. Mainly useful for
 	 * establishing connectivity before the caller knows what to subscribe
-	 * to; subscribe() alone is sufficient for the common case. */
+	 * to; subscribe()/replaceSubscriptions() alone are sufficient for the
+	 * common case. */
 	connect(): Promise<void> {
 		this.closed = false;
 		return this.enqueue(() => this.ensureConnected(false));
 	}
 
-	/** Adds subscriptions to the desired set and ensures the event
-	 * connection reflects the full merged set. If nothing new is being
-	 * added and the connection is already up, this is a no-op. If the
-	 * connection is already up and subscribed, and something new IS being
-	 * added, this closes and reopens the connection (per the verified
-	 * constraint that a second events.subscribe on a live subscribed
-	 * connection just gets closed) and resubscribes with the full merged
-	 * set - never an incremental subscribe on a live connection. */
+	/** Adds subscriptions to the accumulate-only "sticky" pool and ensures
+	 * the event connection reflects the full merged set. Use for
+	 * subscriptions that never need pruning (herdr's pane-id-less lifecycle
+	 * events). If nothing new is being added and the connection is already
+	 * up, this is a no-op. If the connection is already up and subscribed,
+	 * and something new IS being added, this closes and reopens the
+	 * connection (per the verified constraint that a second
+	 * events.subscribe on a live subscribed connection just gets closed)
+	 * and resubscribes with the full merged set - never an incremental
+	 * subscribe on a live connection. */
 	subscribe(subscriptions: HerdrSubscription[]): Promise<void> {
 		if (subscriptions.length === 0) return Promise.resolve();
 		this.closed = false;
 		return this.enqueue(() => this.doSubscribe(subscriptions));
+	}
+
+	/** Replaces the "managed" pool wholesale with exactly `subscriptions` -
+	 * unlike subscribe(), a subscription present in a PREVIOUS call but
+	 * absent from this one is dropped, not kept. Use for subscriptions
+	 * whose validity is tied to something that can disappear (per-pane
+	 * pane.agent_status_changed): the caller is expected to pass the
+	 * CURRENT LIVE set every time (e.g. AgentRegistry's most recent
+	 * agent.list), not an accumulated history - see the class comment's
+	 * "Two accumulation policies" section for why the original
+	 * accumulate-forever design could permanently wedge the connection.
+	 * An empty array is a meaningful call (drop every managed
+	 * subscription), not a no-op, unlike subscribe(). Reopens the
+	 * connection only if the resulting set actually differs from what's
+	 * already active - calling this repeatedly with an unchanged set (the
+	 * common case: a poll tick that discovered nothing new) is cheap. */
+	replaceSubscriptions(subscriptions: HerdrSubscription[]): Promise<void> {
+		this.closed = false;
+		return this.enqueue(() => this.doReplace(subscriptions));
 	}
 
 	close(): void {
@@ -174,17 +279,18 @@ export class HerdrClient extends EventEmitter {
 			const waiter = this.subscribeAckWaiter;
 			this.subscribeAckWaiter = undefined;
 			this.pendingSubscribeId = undefined;
+			this.pendingSubscribeSnapshot = undefined;
 			waiter.reject(new Error("herdr client closed"));
 		}
 	}
 
-	private mergeDesired(subscriptions: HerdrSubscription[]): boolean {
+	private mergeSticky(subscriptions: HerdrSubscription[]): boolean {
 		let added = false;
 		for (const sub of subscriptions) {
 			const key = subscriptionKey(sub);
-			if (!this.desiredKeys.has(key)) {
-				this.desiredKeys.add(key);
-				this.desiredSubscriptions.push(sub);
+			if (!this.stickyKeys.has(key)) {
+				this.stickyKeys.add(key);
+				this.stickySubscriptions.push(sub);
 				added = true;
 			}
 		}
@@ -192,8 +298,61 @@ export class HerdrClient extends EventEmitter {
 	}
 
 	private async doSubscribe(subscriptions: HerdrSubscription[]): Promise<void> {
-		const added = this.mergeDesired(subscriptions);
+		const added = this.mergeSticky(subscriptions);
 		await this.ensureConnected(added);
+	}
+
+	/** Replaces `managedSubscriptions`/`managedKeys` wholesale (deduping the
+	 * input against itself) and reports whether the resulting SET actually
+	 * differs from what was already active - the signal doReplace() uses to
+	 * decide whether a reopen is warranted. */
+	private setManaged(subscriptions: HerdrSubscription[]): boolean {
+		const deduped: HerdrSubscription[] = [];
+		const nextKeys = new Set<string>();
+		for (const sub of subscriptions) {
+			const key = subscriptionKey(sub);
+			if (nextKeys.has(key)) continue;
+			nextKeys.add(key);
+			deduped.push(sub);
+		}
+		if (setsEqual(nextKeys, this.managedKeys)) return false;
+		this.managedSubscriptions = deduped;
+		this.managedKeys = nextKeys;
+		return true;
+	}
+
+	private async doReplace(subscriptions: HerdrSubscription[]): Promise<void> {
+		const changed = this.setManaged(subscriptions);
+		await this.ensureConnected(changed);
+	}
+
+	/** Removes a single subscription (by its `type:pane_id` key) from
+	 * whichever pool currently holds it. Used only by the subscribe-error
+	 * path (see rejectPendingSubscribe()): herdr just told us this exact
+	 * subscription is invalid, so re-sending it on the next reconnect would
+	 * only reproduce the same rejection forever. */
+	private dropSubscription(key: string): void {
+		if (this.stickyKeys.delete(key)) {
+			this.stickySubscriptions = this.stickySubscriptions.filter((s) => subscriptionKey(s) !== key);
+		}
+		if (this.managedKeys.delete(key)) {
+			this.managedSubscriptions = this.managedSubscriptions.filter((s) => subscriptionKey(s) !== key);
+		}
+	}
+
+	/** The actual set sent to herdr on (re)connect: sticky ++ managed,
+	 * deduped (a managed entry whose key already exists in the sticky pool
+	 * is dropped in favor of the sticky one - not expected to occur in
+	 * practice since the two pools are used for disjoint subscription
+	 * types, but keeps the wire frame from ever carrying a genuine
+	 * duplicate). */
+	private combinedDesired(): HerdrSubscription[] {
+		if (this.managedSubscriptions.length === 0) return this.stickySubscriptions;
+		const combined = [...this.stickySubscriptions];
+		for (const sub of this.managedSubscriptions) {
+			if (!this.stickyKeys.has(subscriptionKey(sub))) combined.push(sub);
+		}
+		return combined;
 	}
 
 	// `wasConnected` is captured up front because it decides two things below:
@@ -229,15 +388,18 @@ export class HerdrClient extends EventEmitter {
 			// a "connected" transition.
 			if (!wasConnected && this.isConnected) this.emit("connected");
 		} catch (err) {
-			if (wasConnected) {
-				// Was genuinely live, and the reopen-to-resubscribe failed: this
-				// IS a real loss of connectivity, not an implementation detail,
-				// even though nothing "dropped" in the handleDrop() sense.
-				// openSocket()'s own onError already called scheduleReconnect()
-				// unconditionally, so this only needs to report the transition.
-				this.isConnected = false;
-				this.emit("disconnected");
-			}
+			// markDisconnected() is idempotent (a no-op unless `isConnected`
+			// is currently true), so this is safe regardless of WHICH path
+			// failed: a plain connection failure (onError; nothing was ever
+			// adopted, isConnected was never touched this attempt) makes this
+			// a no-op, matching the original "only report a transition if we
+			// were genuinely live before" behavior. A failure at the
+			// subscribe step of a *reopen* of a previously-live connection
+			// (onConnect's sendSubscribe rejection handler, below) already
+			// called handleDrop() - which already flipped isConnected and
+			// emitted - before this catch ever runs, so this is *also* a
+			// no-op there; the transition was already reported exactly once.
+			this.markDisconnected();
 			throw err;
 		}
 	}
@@ -260,6 +422,30 @@ export class HerdrClient extends EventEmitter {
 	private teardownSocket(): void {
 		this.destroySocketHandle();
 		this.isConnected = false;
+	}
+
+	/** Sets `isConnected` true and resets the reconnect backoff - the ONLY
+	 * place either happens (Finding 2 / Finding 3). Reached only once a
+	 * connection is genuinely usable: either there was nothing to subscribe
+	 * to, or herdr actually acknowledged the subscribe. A connection that
+	 * establishes and then immediately dies at the subscribe step (Finding
+	 * 1's exact repro) therefore never resets `attempt`, so backoff keeps
+	 * growing across repeated failures instead of resetting every cycle. */
+	private markConnected(): void {
+		this.isConnected = true;
+		this.attempt = 0;
+	}
+
+	/** Flips `isConnected` false and emits "disconnected" - but only if it
+	 * was true. Idempotent by design: both ensureConnected()'s catch and
+	 * handleDrop() call this, and exactly one of them will find
+	 * `isConnected` still true (the other either never set it or already
+	 * flipped it), so a genuine transition is reported exactly once no
+	 * matter which path gets there first. */
+	private markDisconnected(): void {
+		if (!this.isConnected) return;
+		this.isConnected = false;
+		this.emit("disconnected");
 	}
 
 	private openSocket(): Promise<void> {
@@ -298,24 +484,29 @@ export class HerdrClient extends EventEmitter {
 				}
 
 				this.socket = socket;
-				this.isConnected = true;
-				this.attempt = 0;
+				this.buffer = "";
+				socket.on("data", (chunk: string) => this.onData(chunk));
+				socket.on("error", () => {});
+				socket.on("close", () => this.handleDrop(socket));
+
 				if (this.reconnectTimer) {
 					clearTimeout(this.reconnectTimer);
 					this.reconnectTimer = undefined;
 				}
-				this.buffer = "";
-				socket.on("data", (chunk: string) => this.onData(chunk));
-				socket.on("error", () => {});
-				socket.on("close", () => this.handleDrop());
 
-				// Deliberately NOT emitting "connected" here: whether this
-				// transport swap is a reportable lifecycle transition depends
-				// on whether the client was already connected before this call
-				// started, which only ensureConnected() (the sole caller) knows
-				// - see its own comment.
+				// Deliberately NOT emitting "connected" here, and NOT yet
+				// calling markConnected(): whether this transport swap is a
+				// reportable lifecycle transition depends on whether the
+				// client was already connected before this call started
+				// (only ensureConnected(), the sole caller, knows that) - and
+				// `isConnected` itself must not flip true until the subscribe
+				// step below (if any) has actually succeeded (Finding 3).
 
-				if (this.desiredSubscriptions.length === 0) {
+				const desired = this.combinedDesired();
+				if (desired.length === 0) {
+					// Nothing to subscribe to: a bare connection is, by
+					// definition, as usable as it's ever going to get.
+					this.markConnected();
 					resolve();
 					return;
 				}
@@ -323,10 +514,32 @@ export class HerdrClient extends EventEmitter {
 				// Re-subscribe with the full desired set immediately, before
 				// this connection is considered usable - this is what makes
 				// "re-subscribe after every reconnect" true both for a
-				// caller-driven resubscribe (doSubscribe's forceReopen path)
-				// and for an unplanned drop (scheduleReconnect's timer, which
-				// funnels back through here too).
-				this.sendSubscribe(this.desiredSubscriptions).then(resolve, reject);
+				// caller-driven resubscribe (doSubscribe's/doReplace's
+				// forceReopen path) and for an unplanned drop
+				// (scheduleReconnect's timer, which funnels back through
+				// here too).
+				this.sendSubscribe(desired).then(
+					() => {
+						this.markConnected();
+						resolve();
+					},
+					(err: Error) => {
+						// The subscribe step itself failed - a rejection
+						// (Finding 1/4) or an ack timeout (Finding 3). Either
+						// way this socket never became genuinely usable, so
+						// `isConnected` must stay false and this must not be
+						// left half-open: if herdr already closed it (the
+						// rejection case - verified live), handleDrop(socket)
+						// is a safe, idempotent re-entry (dispatch() already
+						// ran its own cleanup, see rejectPendingSubscribe());
+						// if herdr did NOT close it (the ack-timeout case,
+						// Finding 3's literal scenario - nothing else would
+						// ever tear this socket down or schedule a retry),
+						// this is what actually does both.
+						this.handleDrop(socket);
+						reject(err);
+					},
+				);
 			};
 
 			socket.once("error", onError);
@@ -342,11 +555,13 @@ export class HerdrClient extends EventEmitter {
 			}
 			const id = `sd-${this.nextId++}`;
 			this.pendingSubscribeId = id;
+			this.pendingSubscribeSnapshot = subscriptions;
 
 			const timeout = setTimeout(() => {
 				if (this.pendingSubscribeId !== id) return;
 				this.subscribeAckWaiter = undefined;
 				this.pendingSubscribeId = undefined;
+				this.pendingSubscribeSnapshot = undefined;
 				reject(new Error("herdr events.subscribe timed out"));
 			}, this.options.requestTimeoutMs ?? 10_000);
 			// Don't hold the process open just for this timer.
@@ -368,19 +583,31 @@ export class HerdrClient extends EventEmitter {
 		});
 	}
 
-	private handleDrop(): void {
+	/** Idempotent, re-entry-safe teardown for an event connection that has
+	 * stopped being usable - whether because herdr closed it (the `socket`
+	 * "close" listener calls this with the socket that closed) or because
+	 * WE need to tear it down ourselves (the sendSubscribe ack-timeout path
+	 * in openSocket(), which passes the same socket so a subsequent natural
+	 * "close" event - if herdr does eventually close it too - is a safe
+	 * no-op re-entry rather than a double teardown). `socket` is omitted
+	 * only by close()'s own explicit teardown, which never calls this. */
+	private handleDrop(socket?: net.Socket): void {
 		if (this.closed) return;
-		if (!this.isConnected) return;
-		this.isConnected = false;
+		if (!this.socket) return; // already handled - idempotent re-entry
+		if (socket && this.socket !== socket) return; // stale event for a superseded socket
+		const current = this.socket;
 		this.socket = undefined;
 		this.buffer = "";
+		current.removeAllListeners();
+		current.destroy();
 		if (this.subscribeAckWaiter) {
 			const waiter = this.subscribeAckWaiter;
 			this.subscribeAckWaiter = undefined;
 			this.pendingSubscribeId = undefined;
+			this.pendingSubscribeSnapshot = undefined;
 			waiter.reject(new Error("herdr event connection dropped"));
 		}
-		this.emit("disconnected");
+		this.markDisconnected();
 		this.scheduleReconnect();
 	}
 
@@ -421,14 +648,45 @@ export class HerdrClient extends EventEmitter {
 		}
 	}
 
+	/** Resolves `id` against a subscribe rejection frame's DERIVED id (see
+	 * the class comment's "Subscribe-error id derivation" section):
+	 * `${pendingSubscribeId}:sub:${index}:probe`. Returns the parsed index,
+	 * or undefined if `id` doesn't match that shape at all (including when
+	 * there's no pending subscribe to match against). Matches on the
+	 * `${pendingSubscribeId}:sub:` PREFIX and parses the following integer
+	 * rather than hardcoding the literal `:probe` suffix - see the class
+	 * comment for why. */
+	private subscribeErrorIndex(id: string): number | undefined {
+		if (!this.pendingSubscribeId) return undefined;
+		const prefix = `${this.pendingSubscribeId}:sub:`;
+		if (!id.startsWith(prefix)) return undefined;
+		const rest = id.slice(prefix.length);
+		const sep = rest.indexOf(":");
+		const idxStr = sep === -1 ? rest : rest.slice(0, sep);
+		if (!/^\d+$/.test(idxStr)) return undefined;
+		return Number(idxStr);
+	}
+
 	private dispatch(message: HerdrResponse): void {
-		if (message.id && this.pendingSubscribeId && message.id === this.pendingSubscribeId) {
-			const waiter = this.subscribeAckWaiter!;
-			this.subscribeAckWaiter = undefined;
-			this.pendingSubscribeId = undefined;
-			if (message.error) waiter.reject(new Error(message.error.message));
-			else waiter.resolve();
-			return;
+		if (message.id && this.pendingSubscribeId) {
+			if (message.id === this.pendingSubscribeId) {
+				const waiter = this.subscribeAckWaiter!;
+				this.subscribeAckWaiter = undefined;
+				this.pendingSubscribeId = undefined;
+				this.pendingSubscribeSnapshot = undefined;
+				// Never actually observed live (a successful subscribe always
+				// echoes the id with no `error`, and a rejected one always
+				// carries the DERIVED id handled below instead) - kept as a
+				// defensive fallback rather than assumed impossible.
+				if (message.error) waiter.reject(new Error(message.error.message));
+				else waiter.resolve();
+				return;
+			}
+			const rejectedIndex = this.subscribeErrorIndex(message.id);
+			if (rejectedIndex !== undefined) {
+				this.rejectPendingSubscribe(rejectedIndex, message.error);
+				return;
+			}
 		}
 		// Everything else arriving on the event connection is a pushed event
 		// (real herdr events never carry an `id` - see
@@ -437,6 +695,32 @@ export class HerdrClient extends EventEmitter {
 		// needing to know the event payload shape at all; AgentRegistry owns
 		// that validation boundary.
 		this.emit("event", message);
+	}
+
+	/** Finding 1/4: a subscribe rejection identifies exactly one bad entry
+	 * (herdr stops at the first invalid subscription in the batch and never
+	 * reports the rest - verified live). Looks it up in the snapshot sent
+	 * alongside the request, drops it from whichever pool holds it so it's
+	 * never resent, tells any listener which one it was (mainly for
+	 * observability/tests), and rejects the waiter so the caller's own
+	 * promise settles. The connection itself is torn down by whoever calls
+	 * this (dispatch() doesn't own that - real herdr closes it right after
+	 * sending this frame, which fires the socket's own "close" handler). */
+	private rejectPendingSubscribe(index: number, error: { code: string; message: string } | undefined): void {
+		const waiter = this.subscribeAckWaiter!;
+		const snapshot = this.pendingSubscribeSnapshot;
+		this.subscribeAckWaiter = undefined;
+		this.pendingSubscribeId = undefined;
+		this.pendingSubscribeSnapshot = undefined;
+
+		const rejected = snapshot?.[index];
+		if (rejected) {
+			this.dropSubscription(subscriptionKey(rejected));
+			this.emit("subscriptionRejected", rejected, error);
+		}
+		waiter.reject(
+			new Error(error ? `herdr rejected a subscription: ${error.message}` : "herdr rejected a subscription"),
+		);
 	}
 
 	/** One connection per call: connect, write the one request, read the one

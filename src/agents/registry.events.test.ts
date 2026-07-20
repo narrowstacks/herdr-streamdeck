@@ -85,6 +85,22 @@ const DOTTED_PANE_CLOSED = {
 	event: "pane.closed",
 };
 
+// Finding 5: same construction as statusChangedEvent() above, but for
+// `pane.focused` - verified live by subscribing to it on a real herdr
+// server and focusing two throwaway panes.
+function focusedEvent(paneId: string, workspaceId = "w1") {
+	return { data: { pane_id: paneId, type: "pane_focused", workspace_id: workspaceId }, event: "pane_focused" };
+}
+
+// The exact bytes captured live (see the eventstream-fix task report):
+// underscored delivery + `data.type` present, same convention as the other
+// lifecycle events - NOT the pane.agent_status_changed convention (dotted,
+// no `data.type`).
+const REAL_PANE_FOCUSED = {
+	data: { pane_id: "w657086528ced52-2", type: "pane_focused", workspace_id: "w657086528ced52" },
+	event: "pane_focused",
+};
+
 async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
 	const start = Date.now();
 	while (!predicate()) {
@@ -420,5 +436,79 @@ describe("AgentRegistry subscriptions", () => {
 		// reappeared via the post-reconnect reconcile - not just relied on
 		// the pre-drop subscription that the new socket never actually saw.
 		expect(paneSubsAfter).toHaveLength(2);
+	});
+
+	it("Finding 5: subscribes to pane.focused globally alongside the other lifecycle events", async () => {
+		const socketPath = await server.start();
+		const seen: HerdrRequest[] = [];
+		server.onRequest((req) => {
+			seen.push(req);
+			if (req.method === "agent.list") {
+				return { id: req.id, result: { agents: [CLAUDE], type: "agent_list" } };
+			}
+			return { id: req.id, result: { type: "subscription_started" } };
+		});
+
+		client = new HerdrClient({ socketPath });
+		await client.connect();
+		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
+		await registry.start();
+
+		const subs = seen
+			.filter((r) => r.method === "events.subscribe")
+			.flatMap((r) => (r.params as { subscriptions: Array<Record<string, unknown>> }).subscriptions);
+
+		expect(subs).toContainEqual({ type: "pane.focused" });
+	});
+
+	it("Finding 5: pane.focused keeps `focused` fresh without waiting for the reconcile tick", async () => {
+		const socketPath = await server.start();
+		const OTHER = { ...CLAUDE, pane_id: "w1-2", cwd: "/work/other", focused: false };
+		server.onRequest((req) => {
+			if (req.method === "agent.list") {
+				return { id: req.id, result: { agents: [CLAUDE, OTHER], type: "agent_list" } };
+			}
+			return { id: req.id, result: { type: "subscription_started" } };
+		});
+
+		client = new HerdrClient({ socketPath });
+		await client.connect();
+		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
+		await registry.start();
+		expect(registry.focused?.paneId).toBe("w1-1");
+
+		const changed = new Promise<void>((resolve) => registry.once("changed", resolve));
+		server.push(focusedEvent("w1-2"));
+		await changed;
+
+		expect(registry.focused?.paneId).toBe("w1-2");
+		expect(registry.getByPaneId("w1-1")?.focused).toBe(false);
+		expect(registry.getByPaneId("w1-2")?.focused).toBe(true);
+	});
+
+	it("Finding 5: applies the literal captured pane.focused payload, and un-focuses everything known if the target is unknown", async () => {
+		const socketPath = await server.start();
+		server.onRequest((req) => {
+			if (req.method === "agent.list") {
+				return { id: req.id, result: { agents: [CLAUDE], type: "agent_list" } };
+			}
+			return { id: req.id, result: { type: "subscription_started" } };
+		});
+
+		client = new HerdrClient({ socketPath });
+		await client.connect();
+		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
+		await registry.start();
+		expect(registry.getByPaneId("w1-1")?.focused).toBe(true);
+
+		// Names a pane (w657086528ced52-2) the registry has never heard of -
+		// governing invariant: better visibly-unknown than confidently-wrong,
+		// so the previously-focused pane must not keep reading focused=true.
+		const changed = new Promise<void>((resolve) => registry.once("changed", resolve));
+		server.push(REAL_PANE_FOCUSED);
+		await changed;
+
+		expect(registry.focused).toBeUndefined();
+		expect(registry.getByPaneId("w1-1")?.focused).toBe(false);
 	});
 });

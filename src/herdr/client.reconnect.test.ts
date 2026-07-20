@@ -52,6 +52,7 @@ describe("HerdrClient reconnect", () => {
 	// must re-subscribe the full desired set, not just reopen a bare socket.
 	it("re-subscribes the full desired set after an unplanned drop and reconnect", async () => {
 		const socketPath = await server.start();
+		server.addPane("w1-1");
 		const seen: HerdrRequest[] = [];
 		server.onRequest((req) => {
 			seen.push(req);
