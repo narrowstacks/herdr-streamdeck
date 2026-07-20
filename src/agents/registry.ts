@@ -50,7 +50,15 @@ export class AgentRegistry extends EventEmitter {
 	// herdr succeeded. A JSON-RPC {error} response leaves the socket open -
 	// `client.connected` stays true - so it can't be the signal that data is
 	// stale. This is. See the `connected` getter and reconcile()'s catch.
-	private lastReconcileOk = true;
+	//
+	// Starts false, and stays false across a disconnect/reconnect, on
+	// purpose: this flag means "real data has been confirmed fresh", and
+	// that's only true once reconcile()'s own success path says so. Resetting
+	// it optimistically anywhere else (e.g. the moment the socket reconnects)
+	// would let `connected` read true for the span of one agent.list round
+	// trip with nothing behind it - the exact stale-while-connected failure
+	// this flag exists to prevent.
+	private lastReconcileOk = false;
 	// Finding 6: agents missing pane_id are dropped (there's no key to track
 	// them by), but that shouldn't be silent. Callers can watch this counter
 	// or listen for "agent:malformed" (emitted with the count dropped on
@@ -126,9 +134,13 @@ export class AgentRegistry extends EventEmitter {
 
 	private onDisconnected = (): void => {
 		this.byPaneId.clear();
-		// A fresh connection deserves a fresh, optimistic trust state; the
-		// next reconcile() will flip it back to false again if it also fails.
-		this.lastReconcileOk = true;
+		// Deliberately do NOT reset lastReconcileOk here. It's cleared, not
+		// restored, exactly like byPaneId above: only the next successful
+		// reconcile() - with real data confirmed fresh from herdr - is allowed
+		// to set it back to true. Optimistically restoring it on reconnect
+		// would make `connected` read true before any post-reconnect data has
+		// arrived, for the whole span of the next agent.list round trip.
+		this.lastReconcileOk = false;
 		this.emit("changed");
 	};
 
@@ -190,6 +202,23 @@ export class AgentRegistry extends EventEmitter {
 		// Finding 5: an in-flight reconcile whose client.request settled
 		// after stop() must not mutate byPaneId or emit.
 		if (this.stopped) return;
+
+		// Finding 2 (round 2): the per-element hardening in toAgentInfo() below
+		// guards a bad ELEMENT, but a malformed `agents` CONTAINER itself (e.g.
+		// herdr sending `agents: {}` or `agents: 5`) is a different failure
+		// shape entirely - `for...of` on a non-iterable throws synchronously,
+		// which would escape reconcile() (rejecting start()'s promise on the
+		// first call, and on later ticks, skipping the very statement that
+		// sets lastReconcileOk = false). Treat it exactly like a request
+		// failure above: same "was this already known-bad" guard against
+		// redundant emits, same lastReconcileOk flip, no throw.
+		if (result.agents !== undefined && !Array.isArray(result.agents)) {
+			if (this.client.connected && this.lastReconcileOk) {
+				this.lastReconcileOk = false;
+				this.emit("changed");
+			}
+			return;
+		}
 
 		const next = new Map<string, AgentInfo>();
 		let malformed = 0;

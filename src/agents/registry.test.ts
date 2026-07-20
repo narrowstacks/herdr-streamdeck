@@ -243,6 +243,125 @@ describe("AgentRegistry", () => {
 		expect(registry.agents[0].workspaceId).toBe("w2");
 	});
 
+	it("round2-F1: connected must not read true until real data has arrived, including right after a reconnect", async () => {
+		const socketPath = await server.start();
+		server.onRequest((req) => {
+			if (req.method === "agent.list") return { id: req.id, result: agentListResult([CLAUDE]) };
+			return { id: req.id, result: { type: "subscription_started" } };
+		});
+
+		client = new HerdrClient({ socketPath, reconnectBaseMs: 15, reconnectMaxMs: 15 });
+		await client.connect();
+		registry = new AgentRegistry(client, { reconcileIntervalMs: 10_000 });
+
+		// Constructed but never started: must never read connected before the
+		// first successful reconcile, even though the underlying socket is
+		// already live.
+		expect(registry.connected).toBe(false);
+
+		await registry.start();
+		expect(registry.connected).toBe(true);
+		expect(registry.agents).toHaveLength(1);
+
+		// Reproduce the reviewer's repro exactly: observe registry.connected
+		// synchronously off the client's own "connected" event, the instant the
+		// socket comes back up but before reconcile()'s round trip to herdr has
+		// resolved.
+		let capturedConnected: boolean | undefined;
+		let capturedAgentCount: number | undefined;
+		client.on("connected", () => {
+			capturedConnected = registry.connected;
+			capturedAgentCount = registry.agents.length;
+		});
+
+		const changedAfterDrop = new Promise<void>((resolve) => registry.once("changed", resolve));
+		server.dropConnections();
+		await changedAfterDrop;
+		expect(registry.connected).toBe(false);
+		expect(registry.agents).toEqual([]);
+
+		const changedAfterReconnect = new Promise<void>((resolve) => registry.once("changed", resolve));
+		await changedAfterReconnect;
+
+		// At the moment "connected" fired - before the post-reconnect
+		// reconcile() had resolved - the registry must NOT have claimed to be
+		// live with no data behind it.
+		expect(capturedConnected).toBe(false);
+		expect(capturedAgentCount).toBe(0);
+
+		// Once the post-reconnect reconcile has actually completed, it's safe
+		// to report live again.
+		expect(registry.connected).toBe(true);
+		expect(registry.agents).toHaveLength(1);
+	});
+
+	it.each([
+		["an object", {}],
+		["a number", 5],
+	])(
+		"round2-F2/F3: a non-array agents container (%s) does not throw, does not stay connected, and recovers on the next good poll",
+		async (_label, malformedAgents) => {
+			const socketPath = await server.start();
+			let mode: "good" | "malformed" = "malformed";
+			server.onRequest((req) => {
+				if (req.method === "agent.list") {
+					if (mode === "malformed") {
+						return { id: req.id, result: { agents: malformedAgents, type: "agent_list" } };
+					}
+					return { id: req.id, result: agentListResult([CLAUDE]) };
+				}
+				return { id: req.id, result: { type: "subscription_started" } };
+			});
+
+			const unhandledRejections: unknown[] = [];
+			const onUnhandled = (reason: unknown) => unhandledRejections.push(reason);
+			process.on("unhandledRejection", onUnhandled);
+
+			try {
+				client = new HerdrClient({ socketPath });
+				await client.connect();
+				registry = new AgentRegistry(client, { reconcileIntervalMs: 20 });
+
+				// (a) start() must not reject even though the very first reconcile
+				// hits a malformed `agents` container, and the poll loop must
+				// still start (scheduleTick() must still run).
+				await expect(registry.start()).resolves.toBeUndefined();
+
+				// (b) must not stay "connected" serving stale/no data as if live.
+				expect(registry.connected).toBe(false);
+				expect(registry.agents).toEqual([]);
+
+				// Let a couple of ticks pass against the same malformed shape to
+				// prove the loop is still alive and connected stays false, not
+				// wedged true by a throw that skipped the failure path.
+				await new Promise((resolve) => setTimeout(resolve, 60));
+				expect(registry.connected).toBe(false);
+
+				// (c) a subsequent good poll recovers and fires "changed".
+				mode = "good";
+				const changed = new Promise<void>((resolve) => registry.once("changed", resolve));
+				await changed;
+
+				expect(registry.connected).toBe(true);
+				expect(registry.agents).toEqual([
+					{
+						paneId: "w1-1",
+						agent: "claude",
+						status: "working",
+						cwd: "/work/dorkroom",
+						focused: true,
+						workspaceId: "w1",
+					},
+				]);
+
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				expect(unhandledRejections).toEqual([]);
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+			}
+		},
+	);
+
 	it("F4: calling start() twice does not double-register listeners or orphan a timer chain", async () => {
 		const socketPath = await server.start();
 		server.onRequest((req) => {
