@@ -1,4 +1,5 @@
 import type { AgentStatus } from "../herdr/types.js";
+import { blockedBadge, disconnectedGlyph, idleBadge, workingBadge } from "./glyphs.js";
 
 export type SlotRender =
 	| { kind: "agent"; status: AgentStatus; agent: string; project: string }
@@ -144,20 +145,25 @@ function label(render: SlotRender): string {
 	}
 }
 
+// A small status badge in the top-right corner, so status is legible by SHAPE
+// and not colour alone (working=spinner ring, idle=dot, blocked="!"). The
+// disconnected state keeps its full-size X. `unknown` gets no badge — there is
+// no meaningful shape for it, and the grey background already reads as "no
+// status". blockedBadge()/disconnectedGlyph() are byte-identical to the shapes
+// that used to live here inline, so those two states render unchanged.
 function glyph(render: SlotRender): string {
-	if (render.kind === "disconnected") {
-		return `<line x1="24" y1="20" x2="48" y2="44" stroke="#e5484d" stroke-width="5" stroke-linecap="round"/>
-		<line x1="48" y1="20" x2="24" y2="44" stroke="#e5484d" stroke-width="5" stroke-linecap="round"/>`;
+	if (render.kind === "disconnected") return disconnectedGlyph();
+	if (render.kind !== "agent") return "";
+	switch (render.status) {
+		case "blocked":
+			return blockedBadge();
+		case "working":
+			return workingBadge();
+		case "idle":
+			return idleBadge();
+		default:
+			return "";
 	}
-	// Blocked keys carry the identifying text like any other agent, so the
-	// warning sits as a small badge in the top-right corner rather than a
-	// centered glyph that would collide with the labels.
-	if (render.kind === "agent" && render.status === "blocked") {
-		return `<circle cx="60" cy="12" r="9" fill="#e5484d" stroke="#ffffff" stroke-width="2"/>
-		<line x1="60" y1="7" x2="60" y2="13.5" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
-		<circle cx="60" cy="16.5" r="1.4" fill="#ffffff"/>`;
-	}
-	return "";
 }
 
 export function slotImage(render: SlotRender, pulseOn: boolean): string {

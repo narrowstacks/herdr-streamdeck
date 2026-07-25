@@ -141,4 +141,23 @@ describe("slotImage", () => {
 		expect(svg).not.toContain("undefined");
 		expect(svg).toContain('fill="#6f6f6f"');
 	});
+
+	it("marks a working agent with a distinct shape badge, not colour alone", () => {
+		const svg = decodeSvg(slotImage({ kind: "agent", status: "working", agent: "claude", project: "d" }, false));
+		expect(svg).toContain('stroke-dasharray="20 12"'); // the spinner-ring badge
+	});
+
+	it("marks an idle agent with a dot badge distinct from the working badge", () => {
+		const working = decodeSvg(slotImage({ kind: "agent", status: "working", agent: "c", project: "d" }, false));
+		const idle = decodeSvg(slotImage({ kind: "agent", status: "idle", agent: "c", project: "d" }, false));
+		expect(idle).not.toContain('stroke-dasharray'); // idle is a solid dot, no ring
+		expect(idle).toContain('r="5.5"');
+		expect(idle).not.toBe(working); // distinguishable without relying on background colour
+	});
+
+	it("gives an unknown-status agent no status badge", () => {
+		const svg = decodeSvg(slotImage({ kind: "agent", status: "unknown" as never, agent: "c", project: "d" }, false));
+		expect(svg).not.toContain('stroke-dasharray'); // no working ring
+		expect(svg).not.toContain('r="9"');             // no blocked "!" disc
+	});
 });
