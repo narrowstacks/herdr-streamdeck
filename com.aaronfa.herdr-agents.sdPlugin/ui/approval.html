@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<script src="https://sdpi-components.dev/releases/v4/sdpi-components.js"></script>
+	</head>
+	<body>
+		<!--
+			Override the key sequence this Approve/Deny key sends. Leave blank to
+			use the shipped keymap (keymap.json, per agent label). herdr's key
+			names are crossterm KeyCode names, case-insensitive: Enter, Esc (NOT
+			"Escape"), Tab, Down, y, 1, ctrl+c … modifiers use "+". Separate a
+			multi-key sequence with spaces or commas (e.g. "y Enter"). A blank
+			field does not override that direction; only the box you fill in wins.
+			Both fields are stored as plain strings and normalised into the
+			keymap's array shape by overrideFromSettings() in approval-action.ts.
+		-->
+		<sdpi-item label="Approve keys">
+			<sdpi-textfield setting="approveKeys" placeholder="blank = use keymap (e.g. Enter)"></sdpi-textfield>
+		</sdpi-item>
+		<sdpi-item label="Deny keys">
+			<sdpi-textfield setting="denyKeys" placeholder="blank = use keymap (e.g. Esc)"></sdpi-textfield>
+		</sdpi-item>
+	</body>
+</html>

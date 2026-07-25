@@ -36,6 +36,7 @@
 			"Name": "Approve",
 			"Icon": "imgs/actions/approve",
 			"Tooltip": "Approve the focused agent's pending request. Only acts when it is blocked.",
+			"PropertyInspectorPath": "ui/approval.html",
 			"Controllers": ["Keypad"],
 			"States": [{ "Image": "imgs/actions/approve" }]
 		},
@@ -44,6 +45,7 @@
 			"Name": "Deny",
 			"Icon": "imgs/actions/deny",
 			"Tooltip": "Deny the focused agent's pending request. Only acts when it is blocked.",
+			"PropertyInspectorPath": "ui/approval.html",
 			"Controllers": ["Keypad"],
 			"States": [{ "Image": "imgs/actions/deny" }]
 		}

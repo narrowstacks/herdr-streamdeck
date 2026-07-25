@@ -130,14 +130,14 @@ describe("ApproveAction.onKeyDown", () => {
 		expect(key.showOk).not.toHaveBeenCalled();
 	});
 
-	it("honours a per-slot override passed in settings", async () => {
+	it("honours a per-key override typed in the property inspector", async () => {
 		pluginState.__state.focused = blocked;
 		const action = new ApproveAction();
 		const key = fakeKeyAction();
 
 		await action.onKeyDown({
 			action: key,
-			payload: { settings: { override: { approve: ["y"] } } },
+			payload: { settings: { approveKeys: "y" } },
 		} as never);
 
 		expect(pluginState.client.request).toHaveBeenCalledWith("pane.send_keys", {
