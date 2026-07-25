@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { AgentStatus } from "../herdr/types.js";
-import { projectLabel, slotImage, slotTitle } from "./render.js";
+import { escapeXml, isLightColor, projectLabel, slotImage, truncate } from "./render.js";
+
+function decodeSvg(image: string): string {
+	return Buffer.from(image.slice("data:image/svg+xml;base64,".length), "base64").toString("utf8");
+}
 
 describe("projectLabel", () => {
 	it("uses the basename of the cwd", () => {
@@ -28,23 +32,40 @@ describe("projectLabel", () => {
 	});
 });
 
-describe("slotTitle", () => {
-	it("shows agent and project for an active agent", () => {
-		expect(slotTitle({ kind: "agent", status: "blocked", agent: "claude", project: "dorkroom" })).toBe(
-			"claude\ndorkroom",
-		);
+describe("escapeXml", () => {
+	it("escapes the five XML metacharacters so a name cannot break the SVG", () => {
+		expect(escapeXml(`a&b<c>d"e'f`)).toBe("a&amp;b&lt;c&gt;d&quot;e&apos;f");
 	});
 
-	it("shows the project for a reserved slot", () => {
-		expect(slotTitle({ kind: "reserved", project: "negpy" })).toBe("negpy");
+	it("leaves ordinary text unchanged", () => {
+		expect(escapeXml("dorkroom")).toBe("dorkroom");
+	});
+});
+
+describe("truncate", () => {
+	it("returns short strings unchanged", () => {
+		expect(truncate("dorkroom", 12)).toBe("dorkroom");
 	});
 
-	it("shows nothing for an unclaimed slot", () => {
-		expect(slotTitle({ kind: "unclaimed" })).toBe("");
+	it("middle-truncates an over-long string, keeping head and tail within max characters", () => {
+		const result = truncate("claude-control-streamdeck", 12);
+		expect(result.length).toBe(12);
+		expect(result).toContain("…");
+		expect(result.startsWith("claude")).toBe(true);
+		expect(result.endsWith("deck")).toBe(true);
+		expect(result).not.toContain("claude-control-streamdeck");
+	});
+});
+
+describe("isLightColor", () => {
+	it("treats the amber working background as light", () => {
+		expect(isLightColor("#f5a524")).toBe(true);
 	});
 
-	it("names the disconnected state explicitly rather than looking idle", () => {
-		expect(slotTitle({ kind: "disconnected" })).toBe("no herdr");
+	it("treats the green, red, and grey backgrounds as dark", () => {
+		expect(isLightColor("#30a46c")).toBe(false);
+		expect(isLightColor("#e5484d")).toBe(false);
+		expect(isLightColor("#6f6f6f")).toBe(false);
 	});
 });
 
@@ -52,6 +73,47 @@ describe("slotImage", () => {
 	it("returns an svg data uri", () => {
 		const image = slotImage({ kind: "unclaimed" }, false);
 		expect(image.startsWith("data:image/svg+xml;base64,")).toBe(true);
+	});
+
+	it("renders the agent name and project inside the icon", () => {
+		const svg = decodeSvg(slotImage({ kind: "agent", status: "idle", agent: "stenobar", project: "streamdeck" }, false));
+		expect(svg).toContain("stenobar");
+		expect(svg).toContain("streamdeck");
+	});
+
+	it("escapes special characters in a name so the svg stays well-formed", () => {
+		const svg = decodeSvg(slotImage({ kind: "agent", status: "idle", agent: "a&b", project: "d" }, false));
+		expect(svg).toContain("a&amp;b");
+		expect(svg).not.toContain("a&b");
+	});
+
+	it("truncates a long project name so it cannot overflow the key", () => {
+		const svg = decodeSvg(
+			slotImage({ kind: "agent", status: "idle", agent: "claude", project: "claude-control-streamdeck" }, false),
+		);
+		expect(svg).not.toContain("claude-control-streamdeck");
+		expect(svg).toContain("…");
+	});
+
+	it("uses dark text on the light amber working background for contrast", () => {
+		const svg = decodeSvg(slotImage({ kind: "agent", status: "working", agent: "claude", project: "d" }, false));
+		expect(svg).toContain('fill="#141414"');
+		expect(svg).not.toContain('fill="#ffffff"');
+	});
+
+	it("uses white text on the dark green idle background", () => {
+		const svg = decodeSvg(slotImage({ kind: "agent", status: "idle", agent: "claude", project: "d" }, false));
+		expect(svg).toContain('fill="#ffffff"');
+	});
+
+	it("still shows the agent name when the agent is blocked", () => {
+		const svg = decodeSvg(slotImage({ kind: "agent", status: "blocked", agent: "stenobar", project: "d" }, false));
+		expect(svg).toContain("stenobar");
+	});
+
+	it("names the disconnected state inside the icon", () => {
+		const svg = decodeSvg(slotImage({ kind: "disconnected" }, false));
+		expect(svg).toContain("no herdr");
 	});
 
 	it("renders blocked differently on and off the pulse", () => {
@@ -75,7 +137,7 @@ describe("slotImage", () => {
 	it("falls back to a defined color instead of emitting a malformed fill for an unrecognized status", () => {
 		const bogusStatus = "corrupted" as unknown as AgentStatus;
 		const image = slotImage({ kind: "agent", status: bogusStatus, agent: "claude", project: "d" }, false);
-		const svg = Buffer.from(image.slice("data:image/svg+xml;base64,".length), "base64").toString("utf8");
+		const svg = decodeSvg(image);
 		expect(svg).not.toContain("undefined");
 		expect(svg).toContain('fill="#6f6f6f"');
 	});
