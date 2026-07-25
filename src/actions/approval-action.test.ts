@@ -31,6 +31,7 @@ vi.mock("../plugin-state.js", async () => {
 			get focused() {
 				return state.focused;
 			},
+			on: vitestVi.fn(), // ApprovalActionBase now subscribes to "changed" in its constructor
 		},
 		keymapTable: () => undefined,
 		client: { request: vitestVi.fn(async () => undefined) },
