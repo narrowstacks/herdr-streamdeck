@@ -8,12 +8,16 @@ import type { JsonValue } from "@elgato/utils";
 import { client, keymapTable, registry } from "../plugin-state.js";
 import { decideApproval } from "./approval.js";
 import { approvalImage, approvalKeyState } from "./approval-render.js";
-import type { KeySequence } from "../keymap/keymap.js";
+import { overrideFromSettings } from "./approval-override.js";
 
 // See the matching comment in agent-slot.ts for why this needs an explicit
 // JsonValue index signature rather than `unknown`.
 export interface ApprovalSettings {
-	override?: Partial<KeySequence>;
+	// Approve/deny key sequences as typed in the property inspector
+	// (whitespace/comma-separated), normalised into the override arrays
+	// resolveKeymap expects by overrideFromSettings(). Blank = use the keymap.
+	approveKeys?: string;
+	denyKeys?: string;
 	[key: string]: JsonValue | undefined;
 }
 
@@ -42,7 +46,7 @@ export abstract class ApprovalActionBase extends SingletonAction<ApprovalSetting
 			focused: registry.focused,
 			intent: this.intent,
 			table: keymapTable(),
-			override: ev.payload.settings.override,
+			override: overrideFromSettings(ev.payload.settings),
 		});
 
 		if (!decision.ok) {
