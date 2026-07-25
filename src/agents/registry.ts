@@ -257,10 +257,6 @@ export class AgentRegistry extends EventEmitter {
 		return this.byPaneId.get(paneId);
 	}
 
-	getByCwd(cwd: string): AgentInfo | undefined {
-		return this.agents.find((a) => a.cwd === cwd);
-	}
-
 	get focused(): AgentInfo | undefined {
 		return this.agents.find((a) => a.focused);
 	}

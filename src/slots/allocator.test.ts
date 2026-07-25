@@ -2,110 +2,138 @@ import { describe, expect, it } from "vitest";
 import { SlotAllocator } from "./allocator.js";
 
 describe("SlotAllocator", () => {
-	it("assigns the lowest registered free slot to a new cwd", () => {
+	it("packs agents into the lowest registered slots in first-seen order, no holes", () => {
+		const allocator = new SlotAllocator();
+		allocator.registerSlot(0);
+		allocator.registerSlot(1);
+		allocator.registerSlot(2);
+
+		allocator.syncAgents(["pane-a", "pane-b"]);
+
+		expect(allocator.paneIdForSlot(0)).toBe("pane-a");
+		expect(allocator.paneIdForSlot(1)).toBe("pane-b");
+		expect(allocator.paneIdForSlot(2)).toBeUndefined(); // trailing slot stays empty
+	});
+
+	it("packs into registered slots in ascending index order even when registered out of order", () => {
 		const allocator = new SlotAllocator();
 		allocator.registerSlot(2);
 		allocator.registerSlot(0);
-		allocator.registerSlot(1);
 
-		expect(allocator.claim("/work/dorkroom")).toBe(0);
-		expect(allocator.claim("/work/negpy")).toBe(1);
-		expect(allocator.claim("/work/hmpc")).toBe(2);
+		allocator.syncAgents(["pane-a", "pane-b"]);
+
+		expect(allocator.paneIdForSlot(0)).toBe("pane-a");
+		expect(allocator.paneIdForSlot(2)).toBe("pane-b");
+		expect(allocator.paneIdForSlot(1)).toBeUndefined(); // never registered
 	});
 
-	it("returns the same slot when the same cwd is claimed again", () => {
+	it("appends a newly-seen agent after the existing ones (newest last)", () => {
+		const allocator = new SlotAllocator();
+		allocator.registerSlot(0);
+		allocator.registerSlot(1);
+		allocator.registerSlot(2);
+
+		allocator.syncAgents(["pane-a", "pane-b"]);
+		allocator.syncAgents(["pane-a", "pane-b", "pane-c"]);
+
+		expect(allocator.paneIdForSlot(2)).toBe("pane-c");
+	});
+
+	it("compacts when an agent disappears: those after it slide down a slot", () => {
+		const allocator = new SlotAllocator();
+		allocator.registerSlot(0);
+		allocator.registerSlot(1);
+		allocator.registerSlot(2);
+
+		allocator.syncAgents(["pane-a", "pane-b", "pane-c"]);
+		allocator.syncAgents(["pane-a", "pane-c"]); // pane-b exits
+
+		expect(allocator.paneIdForSlot(0)).toBe("pane-a");
+		expect(allocator.paneIdForSlot(1)).toBe("pane-c"); // slid down from slot 2
+		expect(allocator.paneIdForSlot(2)).toBeUndefined();
+	});
+
+	it("does not reshuffle existing agents when herdr reports them in a different order", () => {
 		const allocator = new SlotAllocator();
 		allocator.registerSlot(0);
 		allocator.registerSlot(1);
 
-		expect(allocator.claim("/work/dorkroom")).toBe(0);
-		expect(allocator.claim("/work/dorkroom")).toBe(0);
+		allocator.syncAgents(["pane-a", "pane-b"]);
+		allocator.syncAgents(["pane-b", "pane-a"]); // same set, reordered input
+
+		expect(allocator.paneIdForSlot(0)).toBe("pane-a"); // first-seen order preserved
+		expect(allocator.paneIdForSlot(1)).toBe("pane-b");
 	});
 
-	it("keeps a slot reserved for a cwd whose agent has exited", () => {
+	it("gives no slot to agents beyond the number of registered slots", () => {
+		const allocator = new SlotAllocator();
+		allocator.registerSlot(0);
+
+		allocator.syncAgents(["pane-a", "pane-b"]);
+
+		expect(allocator.slotForPaneId("pane-a")).toBe(0);
+		expect(allocator.slotForPaneId("pane-b")).toBeUndefined();
+		expect(allocator.paneIdForSlot(0)).toBe("pane-a");
+	});
+
+	it("reports the slot a given pane occupies", () => {
 		const allocator = new SlotAllocator();
 		allocator.registerSlot(0);
 		allocator.registerSlot(1);
-		allocator.claim("/work/dorkroom");
-		allocator.claim("/work/negpy");
+		allocator.syncAgents(["pane-a", "pane-b"]);
 
-		// negpy's agent exits — nothing is released. A new project must not take slot 1.
-		expect(allocator.claim("/work/stenobar")).toBeUndefined();
-		expect(allocator.cwdForSlot(1)).toBe("/work/negpy");
+		expect(allocator.slotForPaneId("pane-b")).toBe(1);
+		expect(allocator.slotForPaneId("pane-unknown")).toBeUndefined();
 	});
 
-	it("returns the original slot when a cwd reappears after its agent exited", () => {
+	it("syncAgents reports whether the ordered set changed", () => {
+		const allocator = new SlotAllocator();
+		allocator.registerSlot(0);
+
+		expect(allocator.syncAgents(["pane-a"])).toBe(true); // new agent
+		expect(allocator.syncAgents(["pane-a"])).toBe(false); // unchanged
+		expect(allocator.syncAgents(["pane-a", "pane-b"])).toBe(true); // added
+		expect(allocator.syncAgents(["pane-b"])).toBe(true); // removed pane-a
+	});
+
+	it("drops an unregistered slot from the packing (its agent slides to the next key)", () => {
 		const allocator = new SlotAllocator();
 		allocator.registerSlot(0);
 		allocator.registerSlot(1);
-		allocator.claim("/work/dorkroom");
-		allocator.claim("/work/negpy");
+		allocator.registerSlot(2);
+		allocator.syncAgents(["pane-a", "pane-b", "pane-c"]);
 
-		expect(allocator.claim("/work/negpy")).toBe(1);
+		allocator.unregisterSlot(1); // the middle key is removed
+
+		// Now only slots 0 and 2 are registered; the three agents pack into them,
+		// so the third agent no longer has a key.
+		expect(allocator.paneIdForSlot(0)).toBe("pane-a");
+		expect(allocator.paneIdForSlot(2)).toBe("pane-b");
+		expect(allocator.slotForPaneId("pane-c")).toBeUndefined();
 	});
 
-	it("returns undefined when every registered slot is taken", () => {
+	it("keeps a slot registered until every key showing it is unregistered (ref-counted)", () => {
 		const allocator = new SlotAllocator();
 		allocator.registerSlot(0);
-		allocator.claim("/work/dorkroom");
+		allocator.registerSlot(0); // two keys both show slot 0
+		allocator.syncAgents(["pane-a"]);
 
-		expect(allocator.claim("/work/negpy")).toBeUndefined();
+		allocator.unregisterSlot(0); // one key removed; slot 0 still shown by the other
+
+		expect(allocator.paneIdForSlot(0)).toBe("pane-a");
 	});
 
-	it("cannot claim a slot that is not registered", () => {
-		const allocator = new SlotAllocator();
-
-		expect(allocator.claim("/work/dorkroom")).toBeUndefined();
-	});
-
-	it("round-trips assignments through toJSON and the constructor", () => {
+	it("round-trips the first-seen order through toJSON and the constructor", () => {
 		const allocator = new SlotAllocator();
 		allocator.registerSlot(0);
 		allocator.registerSlot(1);
-		allocator.claim("/work/dorkroom");
-		allocator.claim("/work/negpy");
+		allocator.syncAgents(["pane-a", "pane-b"]);
 
 		const restored = new SlotAllocator(allocator.toJSON());
 		restored.registerSlot(0);
 		restored.registerSlot(1);
 
-		expect(restored.slotForCwd("/work/negpy")).toBe(1);
-		expect(restored.cwdForSlot(0)).toBe("/work/dorkroom");
-	});
-
-	it("keeps assignments for slots that are no longer registered", () => {
-		const allocator = new SlotAllocator();
-		allocator.registerSlot(0);
-		allocator.claim("/work/dorkroom");
-		allocator.unregisterSlot(0);
-
-		expect(allocator.slotForCwd("/work/dorkroom")).toBe(0);
-	});
-
-	it("preserves slot assignment across unregister/reregister cycles when other free slots exist", () => {
-		const allocator = new SlotAllocator();
-		allocator.registerSlot(0);
-		allocator.registerSlot(1);
-		allocator.registerSlot(2);
-
-		// Claim three projects, filling all slots
-		expect(allocator.claim("/work/alpha")).toBe(0);
-		expect(allocator.claim("/work/beta")).toBe(1);
-		expect(allocator.claim("/work/gamma")).toBe(2);
-
-		// Unregister beta's slot (deck key removed, but assignment stays)
-		allocator.unregisterSlot(1);
-
-		// Register a new slot
-		allocator.registerSlot(3);
-
-		// Beta's original slot (1) is unregistered but reserved. Even though free slot 3 exists,
-		// beta must retain its original assignment when claimed again.
-		expect(allocator.claim("/work/beta")).toBe(1);
-
-		// Verify the full state
-		expect(allocator.slotForCwd("/work/alpha")).toBe(0);
-		expect(allocator.slotForCwd("/work/beta")).toBe(1);
-		expect(allocator.slotForCwd("/work/gamma")).toBe(2);
+		expect(restored.paneIdForSlot(0)).toBe("pane-a");
+		expect(restored.paneIdForSlot(1)).toBe("pane-b");
 	});
 });

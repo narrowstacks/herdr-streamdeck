@@ -34,7 +34,7 @@ export function allocator(): SlotAllocator {
 // non-JSON-aware state shape), so this settings-layer type states the JSON
 // contract separately rather than pushing an SDK-only constraint onto it.
 interface GlobalSettings {
-	slots?: { assignments: Record<string, number> };
+	slots?: { order: string[] };
 	[key: string]: JsonValue | undefined;
 }
 
@@ -58,7 +58,7 @@ export async function loadSlots(): Promise<void> {
 // `setGlobalSettings` lands last wins - the other call's intended write is
 // silently lost, which is how a slot assignment fails to survive a Stream
 // Deck restart despite `saveSlots()` having been "called". `agent-slot.ts`
-// no longer calls this once per key per render (see claimUnassignedAgents'
+// no longer calls this once per key per render (see reconcileSlotAssignments'
 // doc comment), but any caller could still fire it more than once in quick
 // succession (e.g. two "changed" events close together), so the guarantee
 // has to live here, not just in the caller.
@@ -102,7 +102,7 @@ async function runSaveCycle(): Promise<void> {
 		// satisfy JsonObject directly.
 		await streamDeck.settings.setGlobalSettings({
 			...settings,
-			slots: { assignments: { ...current.toJSON().assignments } },
+			slots: { order: [...current.toJSON().order] },
 		});
 	} while (saveQueued);
 }

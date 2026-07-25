@@ -13,30 +13,27 @@ import { projectLabel, type SlotRender } from "../slots/render.js";
 export interface RegistrySnapshot {
 	readonly connected: boolean;
 	readonly agents: readonly AgentInfo[];
-	getByCwd(cwd: string): AgentInfo | undefined;
+	getByPaneId(paneId: string): AgentInfo | undefined;
 }
 
 /**
- * Claims a slot for every currently-known agent whose cwd doesn't have one
- * yet. Finding 2/3: this used to re-run, from scratch, once per key inside
- * the render loop (`renderFor` was called once per key by `renderAll`) - an
- * O(agents) scan repeated O(keys) times per pass for no benefit, since the
- * outcome does not depend on which key is being rendered. It is now called
- * once per `renderAll()` pass; the caller decides whether the `claimed`
+ * Brings the allocator's first-seen agent order in line with the live agent
+ * set (see SlotAllocator.syncAgents): newly-appeared agents are appended,
+ * departed ones drop out, and the allocator packs whatever remains into the
+ * registered slots with no gaps. Agents are keyed by `pane_id`, not cwd, so two
+ * agents sharing a directory (e.g. a claude and a codex in the same repo) each
+ * get their own key.
+ *
+ * Returns whether the ordered set changed, so the caller can decide whether the
  * result warrants a persistence write.
  *
- * Safety property: a disconnected registry claims nothing - claiming while
- * disconnected could reserve slots against stale/unconfirmed agent data.
+ * Safety property: a disconnected registry changes nothing - its agent list is
+ * untrusted/stale, so syncing against it (which would drop every "missing"
+ * agent) is not safe. The existing order is preserved until real data returns.
  */
-export function claimUnassignedAgents(registry: RegistrySnapshot, alloc: SlotAllocator): boolean {
+export function reconcileSlotAssignments(registry: RegistrySnapshot, alloc: SlotAllocator): boolean {
 	if (!registry.connected) return false;
-	let claimed = false;
-	for (const agent of registry.agents) {
-		if (alloc.slotForCwd(agent.cwd) === undefined) {
-			if (alloc.claim(agent.cwd) !== undefined) claimed = true;
-		}
-	}
-	return claimed;
+	return alloc.syncAgents(registry.agents.map((agent) => agent.paneId));
 }
 
 /**
@@ -48,15 +45,20 @@ export function claimUnassignedAgents(registry: RegistrySnapshot, alloc: SlotAll
  * show live-looking agent data while the registry itself doesn't trust its
  * own data freshness (see `AgentRegistry.connected`'s own doc comment for
  * why `connected` alone, not just a live socket, is what that means).
+ *
+ * An assigned slot whose pane has no live agent renders `unclaimed` (blank):
+ * under pane-id keying a gone pane is gone for good, and
+ * `reconcileSlotAssignments` releases it before the next render anyway, so
+ * there is no persistent "reserved" state to show.
  */
 export function slotRenderFor(registry: RegistrySnapshot, alloc: SlotAllocator, slotIndex: number): SlotRender {
 	if (!registry.connected) return { kind: "disconnected" };
 
-	const cwd = alloc.cwdForSlot(slotIndex);
-	if (!cwd) return { kind: "unclaimed" };
+	const paneId = alloc.paneIdForSlot(slotIndex);
+	if (!paneId) return { kind: "unclaimed" };
 
-	const agent = registry.getByCwd(cwd);
-	if (!agent) return { kind: "reserved", project: projectLabel(cwd) };
+	const agent = registry.getByPaneId(paneId);
+	if (!agent) return { kind: "unclaimed" };
 
 	return {
 		kind: "agent",
@@ -64,6 +66,34 @@ export function slotRenderFor(registry: RegistrySnapshot, alloc: SlotAllocator, 
 		agent: agent.agent,
 		project: projectLabel(agent.cwd),
 	};
+}
+
+export interface SlotSelectItem {
+	label: string;
+	value: string;
+}
+
+/**
+ * Builds the label/value list for the property inspector's slot picker (see
+ * ui/agent-slot.html's `datasource="getSlots"`), so the dropdown reads
+ * "3: codex · stenobar" instead of a bare "3" - you can tell which agent each
+ * slot currently holds without guessing.
+ *
+ * Always returns exactly `count` items (values "0".."count-1" as strings, since
+ * the setting round-trips through the PI as a string), independent of the herdr
+ * connection - the slot list itself must stay selectable even when nothing is
+ * running. Only the agent/directory annotation depends on live data: a
+ * disconnected registry (whose agent list isn't trusted) shows plain numbers.
+ */
+export function slotSelectItems(registry: RegistrySnapshot, alloc: SlotAllocator, count: number): SlotSelectItem[] {
+	const items: SlotSelectItem[] = [];
+	for (let i = 0; i < count; i++) {
+		const paneId = registry.connected ? alloc.paneIdForSlot(i) : undefined;
+		const agent = paneId ? registry.getByPaneId(paneId) : undefined;
+		const label = agent ? `${i + 1}: ${agent.agent} · ${projectLabel(agent.cwd)}` : `${i + 1}`;
+		items.push({ label, value: String(i) });
+	}
+	return items;
 }
 
 /**
