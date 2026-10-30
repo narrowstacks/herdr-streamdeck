@@ -14,7 +14,7 @@
     "node": ">=20.5.1"
   },
   "dependencies": {
-    "@elgato/streamdeck": "^2.1.0"
+    "@elgato/streamdeck": "^3.0.0"
   },
   "devDependencies": {
     "@elgato/utils": "^0.4.4",
